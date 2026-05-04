@@ -33,11 +33,16 @@ src/canopy/
 │   ├── bot_resolutions.py   # M3: persistent log of bot comments addressed via `commit --address`
 │   ├── bot_status.py        # M3: per-feature bot-comment rollup
 │   ├── augments.py          # M2: per-workspace augment resolver (preflight_cmd, review_bots, ...)
+│   ├── bootstrap.py         # M6: env-file copy + install_cmd + IDE workspace gen for worktrees
+│   ├── conflicts.py         # M12: cross-feature file/line overlap detection
+│   ├── draft_replies.py     # M9: file-history-based addressed-comment classifier + reply templates
 │   ├── historian.py         # M4: cross-session feature memory at .canopy/memory/<feature>.md
+│   ├── ide_workspace.py     # M6: pure renderer for `.code-workspace` files
 │   ├── preflight_state.py   # records preflight result for state machine
 │   ├── reads.py             # 4 alias-aware read primitives
 │   ├── realign.py           # internal helper used by switch (deprecated from CLI/MCP in Wave 2.9)
 │   ├── review_filter.py     # temporal classifier
+│   ├── ship.py              # M8: PR open/update orchestrator with cross-repo body links
 │   ├── stash.py             # feature-tagged stash save/list/pop
 │   ├── switch.py            # WAVE 2.9: canonical-slot focus primitive
 │   ├── switch_preflight.py  # WAVE 2.9: predictable-failure detection for switch
@@ -54,7 +59,7 @@ src/canopy/
 │   ├── github.py            # GitHub PR + comments (MCP or gh CLI fallback)
 │   └── precommit.py         # detect + run pre-commit hooks
 └── mcp/
-    ├── server.py            # MCP server — 54 tools, stdio transport
+    ├── server.py            # MCP server — 59 tools, stdio transport
     └── client.py            # MCP client — stdio + HTTP+OAuth transports
 ```
 
@@ -100,7 +105,7 @@ For integration testing against real services, see `~/projects/canopy-test/` (me
 - **Skill bundling:** Bundled skills live at `src/canopy/agent_setup/skills/<name>/SKILL.md`. `canopy setup-agent` copies them to `~/.claude/skills/<name>/SKILL.md`. The default `using-canopy` skill always installs; opt-in extras (e.g. `augment-canopy`) install via `--skill <name>` (repeatable). Foreign skills with the same path are not overwritten without `--reinstall`. The `_SKILL_SOURCE` constant remains as a backward-compat alias pointing at `using-canopy`'s source.
 - **Version bumps:** When shipping a milestone, bump `__version__` in [`src/canopy/__init__.py`](src/canopy/__init__.py) and add a section to [`CHANGELOG.md`](CHANGELOG.md). The version handshake (`canopy --version`, `mcp__canopy__version`, doctor's `cli_stale` / `mcp_stale` checks) is only useful when this number actually moves — drift was the bug 0.5.0 caught.
 
-## MCP Server (54 tools)
+## MCP Server (59 tools)
 
 Grouped by topic. Run with `canopy-mcp` (entry point) or `python -m canopy.mcp.server`.
 
@@ -110,13 +115,14 @@ Workspace:    workspace_status, workspace_context, workspace_config, workspace_r
 Feature:      feature_create, feature_list, feature_status, feature_diff,
               feature_changes, feature_merge_readiness, feature_paths, feature_done,
               feature_link_linear, feature_state
-Actions:      switch, triage, drift          # realign deprecated from MCP; internal helper
+Actions:      switch, triage, drift, conflicts   # realign deprecated; conflicts = M12
 Reads:        linear_get_issue, github_get_pr, github_get_branch, github_get_pr_comments,
-              linear_my_issues
+              linear_my_issues, pr_checks         # pr_checks = M10 CI rollup
+Workflow:     ship, draft_replies                 # M8 + M9 — capstone + addressed-comment drafts
 Run/Pre:      run, preflight, review_status, review_comments, review_prep
 Stash:        stash_save_feature, stash_list_grouped, stash_pop_feature,
               stash_save, stash_pop, stash_list, stash_drop
-Worktree:     worktree_create, worktree_info
+Worktree:     worktree_create, worktree_info, worktree_bootstrap   # bootstrap = M6
 Branch:       branch_list, branch_delete, branch_rename
 Misc:         log, checkout, sync
 ```
