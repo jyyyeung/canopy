@@ -3,14 +3,18 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 
 import { CanopyClient } from "./canopyClient";
+import { CanopyCli } from "./canopyCli";
+import { resolveCanopyCli } from "./cliResolver";
 import { runCreateFeature } from "./commands/createFeature";
 import { runCreateFeatureFromIssue } from "./commands/createFeatureFromIssue";
 import { runInstallBackend } from "./commands/installBackend";
 import { runSetupWizard } from "./commands/setupWizard";
+import { StateReader } from "./stateReader";
 import { LinearIssue } from "./types";
 import { resolveCanopyMcp } from "./mcpResolver";
 import { StatusBarManager } from "./statusBar";
 import { CanopyTreeProvider } from "./views/canopyTreeProvider";
+import { GlobalDashboardPanel } from "./views/GlobalDashboardPanel";
 import { createWatchers } from "./watchers";
 import {
   DashboardPanel,
@@ -20,6 +24,8 @@ import {
 import { CockpitPanel } from "./webview/cockpitPanel";
 import { NewFeaturePanel } from "./webview/newFeaturePanel";
 import { isSwitchBlocker } from "./canopyClient";
+
+const GLOBAL_DASHBOARD_SEEN_KEY = "canopy.globalDashboardSeen";
 
 interface Active {
   client: CanopyClient;
@@ -71,6 +77,19 @@ async function bootstrap(
   output.appendLine(
     `[canopy] resolved canopy-mcp → ${resolved.path} (${resolved.resolvedVia})`,
   );
+
+  // CLI transport for the new pastel global dashboard. Resolves the
+  // `canopy` binary independently of the MCP path so a user with
+  // `canopy-mcp` on PATH but `canopy` only in pipx still works.
+  const cliResolution = resolveCanopyCli(
+    config.get<string>("cliPath", "canopy"),
+    root.uri.fsPath,
+  );
+  output.appendLine(
+    `[canopy] resolved canopy CLI → ${cliResolution.path} (${cliResolution.resolvedVia})`,
+  );
+  const cli = new CanopyCli(cliResolution.path, root.uri.fsPath);
+  const stateReader = new StateReader(root.uri.fsPath);
 
   const client = new CanopyClient(resolved.path, root.uri.fsPath, output);
   context.subscriptions.push({ dispose: () => void client.dispose() });
@@ -164,12 +183,15 @@ async function bootstrap(
       tree.refresh();
       CockpitPanel.refreshIfOpen();
       DashboardPanel.invalidateAll();
+      stateReader.invalidate("features");
+      GlobalDashboardPanel.invalidate();
     },
     onWorktreeChanged: () => {
       tree.refresh();
       void status.refresh();
       CockpitPanel.refreshIfOpen();
       DashboardPanel.invalidateAll();
+      GlobalDashboardPanel.invalidate();
     },
     // Wave 2.9 state files (active_feature.json, heads.json,
     // preflight.json) — drive the cockpit's auto-refresh so a
@@ -178,6 +200,10 @@ async function bootstrap(
     onStateFilesChanged: () => {
       CockpitPanel.refreshIfOpen();
       DashboardPanel.invalidateAll();
+      stateReader.invalidate("active_feature");
+      stateReader.invalidate("heads");
+      stateReader.invalidate("preflight");
+      GlobalDashboardPanel.invalidate();
     },
   });
   context.subscriptions.push(watchers);
@@ -198,6 +224,8 @@ async function bootstrap(
   };
 
   registerCommands(context, client, refresh);
+  registerGlobalDashboardCommand(context, root.uri, cli, stateReader, output);
+  await maybeAutoOpenGlobalDashboard(context);
   // Diagnostic commands (showLog, retryConnect, installBackend) are now
   // registered earlier, in registerDiagnosticCommands(). This block keeps
   // only commands that depend on a connected MCP.
@@ -735,6 +763,49 @@ async function hasLinearConfig(root: vscode.WorkspaceFolder): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * Register the new global dashboard command + a routing alias that activates
+ * it from the existing tree-view title bar click. Kept in its own helper so
+ * the wiring stays out of the main `bootstrap` body.
+ */
+function registerGlobalDashboardCommand(
+  context: vscode.ExtensionContext,
+  workspaceRoot: vscode.Uri,
+  cli: CanopyCli,
+  stateReader: StateReader,
+  output: vscode.OutputChannel,
+): void {
+  context.subscriptions.push(
+    vscode.commands.registerCommand("canopy.openGlobalDashboard", () => {
+      GlobalDashboardPanel.show(context, workspaceRoot, cli, stateReader, output);
+    }),
+    vscode.commands.registerCommand("canopy.openConfigFile", async () => {
+      const tomlUri = vscode.Uri.joinPath(workspaceRoot, "canopy.toml");
+      try {
+        const doc = await vscode.workspace.openTextDocument(tomlUri);
+        await vscode.window.showTextDocument(doc);
+      } catch (err) {
+        void vscode.window.showErrorMessage(
+          `Canopy: open canopy.toml failed — ${(err as Error).message}`,
+        );
+      }
+    }),
+  );
+}
+
+/**
+ * First-activation auto-open. Per the pastel-rebuild plan (decision #6),
+ * this is per-user, not per-workspace — once you've seen the dashboard you
+ * know it exists, no need to re-onboard for every workspace.
+ */
+async function maybeAutoOpenGlobalDashboard(
+  context: vscode.ExtensionContext,
+): Promise<void> {
+  if (context.globalState.get<boolean>(GLOBAL_DASHBOARD_SEEN_KEY)) return;
+  await context.globalState.update(GLOBAL_DASHBOARD_SEEN_KEY, true);
+  await vscode.commands.executeCommand("canopy.openGlobalDashboard");
 }
 
 function findCanopyRoot(): vscode.WorkspaceFolder | null {

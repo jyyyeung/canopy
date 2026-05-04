@@ -148,6 +148,7 @@ name = "github_issues"
       repo_names: ["api", "ui"],
       tracker_type: "github_issues",
       repo_labels: {},
+      max_worktrees: 0,
     });
   });
 
@@ -191,7 +192,18 @@ name = "api"
       repo_names: [],
       tracker_type: "",
       repo_labels: {},
+      max_worktrees: 0,
     });
+  });
+
+  it("captures workspace.max_worktrees when set as an integer", () => {
+    const toml = `
+[workspace]
+name = "x"
+max_worktrees = 3
+`;
+    const out = parseCanopyTomlMinimal(toml);
+    expect(out.max_worktrees).toBe(3);
   });
 
   it("ignores sections we don't care about (augments, sub-tables)", () => {

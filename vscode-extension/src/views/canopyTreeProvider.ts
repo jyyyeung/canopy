@@ -5,11 +5,11 @@ import { LinearIssue } from "../types";
 
 type Kind =
   | "section-active"
-  | "section-features"
-  | "section-linear"
+  | "section-launchers"
+  | "section-issues"
   | "active-feature"
   | "active-repo"
-  | "feature"
+  | "launcher"
   | "linear-issue"
   | "empty";
 
@@ -35,7 +35,6 @@ export class CanopyTreeProvider implements vscode.TreeDataProvider<CanopyNode> {
   readonly onDidChangeTreeData = this._onDidChange.event;
 
   private linearCount = 0;
-  private featureCount = 0;
 
   constructor(
     private readonly client: CanopyClient,
@@ -70,15 +69,14 @@ export class CanopyTreeProvider implements vscode.TreeDataProvider<CanopyNode> {
           contextValue: "section",
         },
         {
-          kind: "section-features",
-          label: "FEATURES",
-          description: this.featureCount ? `${this.featureCount}` : undefined,
+          kind: "section-launchers",
+          label: "LAUNCHERS",
           collapsibleState: vscode.TreeItemCollapsibleState.Expanded,
           contextValue: "section",
         },
         {
-          kind: "section-linear",
-          label: "LINEAR INBOX",
+          kind: "section-issues",
+          label: "ISSUES",
           description: this.linearCount ? `${this.linearCount} todos` : undefined,
           collapsibleState: vscode.TreeItemCollapsibleState.Collapsed,
           contextValue: "section",
@@ -89,9 +87,9 @@ export class CanopyTreeProvider implements vscode.TreeDataProvider<CanopyNode> {
     switch (parent.kind) {
       case "section-active":
         return this.activeChildren();
-      case "section-features":
-        return this.featureChildren();
-      case "section-linear":
+      case "section-launchers":
+        return this.launcherChildren();
+      case "section-issues":
         return this.linearChildren();
       case "active-feature":
         return this.activeRepoChildren(parent.featureName!);
@@ -148,9 +146,8 @@ export class CanopyTreeProvider implements vscode.TreeDataProvider<CanopyNode> {
         collapsibleState: vscode.TreeItemCollapsibleState.Expanded,
         featureName: active,
         command: {
-          command: "canopy.openDashboard",
+          command: "canopy.openGlobalDashboard",
           title: "Open dashboard",
-          arguments: [active],
         },
       },
     ];
@@ -191,48 +188,42 @@ export class CanopyTreeProvider implements vscode.TreeDataProvider<CanopyNode> {
     });
   }
 
-  private async featureChildren(): Promise<CanopyNode[]> {
-    let features;
-    try {
-      features = await this.client.featureList();
-    } catch (err) {
-      return [
-        {
-          kind: "empty",
-          label: `error: ${(err as Error).message}`,
-          collapsibleState: vscode.TreeItemCollapsibleState.None,
-        },
-      ];
-    }
-    const active = this.getActiveFeature();
-    const visible = features.filter((f: { name: string }) => f.name !== active);
-    this.featureCount = visible.length;
-    if (!visible.length) {
-      return [
-        {
-          kind: "empty",
-          label: active ? "(no other features)" : "(no features yet)",
-          collapsibleState: vscode.TreeItemCollapsibleState.None,
-        },
-      ];
-    }
-    return visible.map((f: { name: string; repos: string[]; linear_issue?: string | null }) => {
-      const linear = f.linear_issue ? ` · ${f.linear_issue}` : "";
-      return {
-        kind: "feature",
-        label: f.name,
-        description: `${f.repos.length} repo${f.repos.length === 1 ? "" : "s"}${linear}`,
-        contextValue: "feature",
-        iconId: "circle-outline",
+  private launcherChildren(): CanopyNode[] {
+    return [
+      {
+        kind: "launcher",
+        label: "Open Dashboard",
+        tooltip: "Open the pastel global dashboard",
+        iconId: "layout",
         collapsibleState: vscode.TreeItemCollapsibleState.None,
-        featureName: f.name,
         command: {
-          command: "canopy.openDashboard",
-          title: "Open dashboard",
-          arguments: [f.name],
+          command: "canopy.openGlobalDashboard",
+          title: "Open Dashboard",
         },
-      };
-    });
+      },
+      {
+        kind: "launcher",
+        label: "New feature from issue",
+        tooltip: "Spin up a feature from a Linear / GitHub issue",
+        iconId: "add",
+        collapsibleState: vscode.TreeItemCollapsibleState.None,
+        command: {
+          command: "canopy.openNewFeature",
+          title: "New feature from issue",
+        },
+      },
+      {
+        kind: "launcher",
+        label: "Open canopy.toml",
+        tooltip: "Edit workspace settings",
+        iconId: "settings-gear",
+        collapsibleState: vscode.TreeItemCollapsibleState.None,
+        command: {
+          command: "canopy.openConfigFile",
+          title: "Open canopy.toml",
+        },
+      },
+    ];
   }
 
   private async linearChildren(): Promise<CanopyNode[]> {

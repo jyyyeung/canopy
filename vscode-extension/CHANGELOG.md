@@ -1,5 +1,40 @@
 # Change Log
 
+## 0.7.0
+
+Pastel dashboard rebuild + the action surface for the new backend commands (`ship` / `draft-replies` / `conflicts` / `worktree-bootstrap` / `pr-checks`).
+
+### Dashboard
+
+- **One panel, two modes.** New `Canopy: Open Dashboard` (and activity-bar tree title bar) opens a React webview that mode-shifts between **global** (canonical / warm / cold lanes + triage rail) and **feature** (issue body + per-repo cards + threads + diff stack + 4-section action drawer). Click any feature in global to drill in; "Back to Global" returns. Auto-opens on first activation per VS Code user.
+- **Theme system.** `canopy.dashboard.theme` offers `minimal` (default — near-monochrome dark), `pastel` (soft blue-grey cream), `navy` (legacy). Live-updates on change — no reload. Tokens reused from `webview/themes/<name>.ts`; `themeShim.ts` maps them onto the shared pastel CSS contract so swapping a theme is a `:root` override, not a CSS rewrite.
+- **Progressive cache + per-section streaming.** Module-level `FEATURE_CACHE` + `GLOBAL_CACHE` survive panel disposal. Each fetch (`feature_state`, `feature_status`, `feature_diff`, `review_comments`, `bot_status`, `issueGet`) writes its slot and posts its own `patch` message — the slowest sibling no longer blocks the focus card. Re-opens are instant. File-watchers trigger silent revalidation in place; write actions wipe and refetch with skeleton flash.
+- **Inline shape-of-data skeletons.** Topbar / breadcrumb / section heads / sidebar render real data immediately. Shimmers appear inline only where async data is in flight, sized + shaped to the slot they'll fill (issue body paragraphs inside `.issue-body`, branch-name shimmer in repo cards, thread-card skeletons grouped by repo, diff-block skeletons with monospace body lines).
+
+### Action surfaces
+
+- **Ship feature** — `canopy ship` capstone in the Commit & push rail. Push + open/update one PR per repo with cross-repo body links.
+- **Draft replies for addressed threads** — `canopy draft-replies` quick-pick per template, clipboard-on-select.
+- **Cross-feature conflicts** — `canopy conflicts` from the Checks rail with toast summary.
+- **Bootstrap worktrees** — `canopy worktree-bootstrap` for env-files + install + `.code-workspace`.
+- **Mark addressed** on bot threads — `canopy commit --address <id> --amend` keeps the bot-resolution log in sync.
+- **CI chips on repo cards** — passing / pending / failing from `feature_state.repos[*].pr.ci_status`.
+- **CTA buttons in focus card** — `next_actions` from `feature_state` map to webview messages (preflight / commit / push / stash / open-feature / refresh).
+
+### Transport + sidebar
+
+- **CLI transport.** `canopyCli.ts` is the dashboard's data plane: direct subprocess to `canopy` with TTL cache, login-shell PATH resolution, and a `cliResolver` that finds the binary across pipx / brew / venv. Typed wrappers added for `ship`, `draftReplies`, `conflicts`, `worktreeBootstrap`, `prChecks`, `switchFeature`, `setConfig`.
+- **Sidebar trimmed to three sections.** ACTIVE (canonical, expandable per-repo), LAUNCHERS (Open Dashboard, New Feature from issue, Open canopy.toml), ISSUES (provider inbox). The legacy FEATURES section moves into the dashboard.
+- **Per-repo target branch.** Feature view's repo cards render `feature/<name> → <target>` from canopy.toml's per-repo `target_branch` augment.
+- **Preflight chip.** Repo cards in feature view show passed / stale / failed against `.canopy/state/preflight.json`.
+- **Address-in-agent plumbing.** Review threads copy context to clipboard + open Claude Code (terminal fallback if extension missing).
+
+### Build
+
+- `.vscodeignore` drops `node_modules/` (esbuild bundles everything). Vsix size 4.5 MB → 460 KB.
+- esbuild copies `pastel.css` to `dist/webview/` so it ships in the packaged extension.
+- React 19 + react-dom added; tsconfig gets `jsx: "react-jsx"` + `lib: [..., "DOM"]`.
+
 ## 0.4.0
 
 - **Single sidebar tree.** The five separate views (Features, Worktrees, Changes, Review Readiness, Linear Issues) are collapsed into one unified `Canopy` tree with three sections: ACTIVE (canonical feature, expandable to per-repo rows with `↑N · M dirty`), FEATURES (other lanes with repo count + Linear ID), and LINEAR INBOX (todo issues, collapsed by default).

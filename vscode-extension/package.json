@@ -2,7 +2,7 @@
   "name": "canopy",
   "displayName": "Canopy — Multi-Repo Worktree Manager",
   "description": "Worktree-first workspace manager for multi-repo development. Features, worktrees, per-repo changes, and review readiness in one sidebar.",
-  "version": "0.4.0",
+  "version": "0.7.0",
   "publisher": "SingularityInc",
   "license": "MIT",
   "icon": "media/canopy-icon.png",
@@ -92,6 +92,11 @@
         "icon": "$(dashboard)"
       },
       {
+        "command": "canopy.openGlobalDashboard",
+        "title": "Canopy: Open Dashboard",
+        "icon": "$(layout)"
+      },
+      {
         "command": "canopy.openNewFeature",
         "title": "Canopy: Spin up a new feature from Linear",
         "icon": "$(add)"
@@ -156,24 +161,33 @@
       {
         "command": "canopy.configureLinear",
         "title": "Canopy: Connect Linear"
+      },
+      {
+        "command": "canopy.openConfigFile",
+        "title": "Canopy: Open canopy.toml"
       }
     ],
     "menus": {
       "view/title": [
         {
-          "command": "canopy.openCockpit",
+          "command": "canopy.openGlobalDashboard",
           "when": "view == canopy.tree",
           "group": "navigation@0"
         },
         {
-          "command": "canopy.openNewFeature",
+          "command": "canopy.openCockpit",
           "when": "view == canopy.tree",
           "group": "navigation@1"
         },
         {
-          "command": "canopy.refresh",
+          "command": "canopy.openNewFeature",
           "when": "view == canopy.tree",
           "group": "navigation@2"
+        },
+        {
+          "command": "canopy.refresh",
+          "when": "view == canopy.tree",
+          "group": "navigation@3"
         },
         {
           "command": "canopy.reinit",
@@ -217,6 +231,11 @@
           "default": "canopy-mcp",
           "description": "Path to the canopy-mcp executable. Use 'canopy-mcp' if it's on PATH, otherwise an absolute path."
         },
+        "canopy.cliPath": {
+          "type": "string",
+          "default": "canopy",
+          "description": "Path to the canopy CLI executable used by the new pastel dashboard. Use 'canopy' if it's on PATH, otherwise an absolute path."
+        },
         "canopy.refreshIntervalSeconds": {
           "type": "number",
           "default": 30,
@@ -230,13 +249,18 @@
         },
         "canopy.dashboard.theme": {
           "type": "string",
-          "default": "navy",
-          "enum": ["navy", "minimal"],
-          "enumDescriptions": [
-            "Canopy Command — deep navy with signal accents",
-            "Near-monochrome with a single accent — quiet / premium"
+          "default": "minimal",
+          "enum": [
+            "minimal",
+            "pastel",
+            "navy"
           ],
-          "description": "Color + typography theme for the canopy dashboard panel. Add new themes by dropping a file in vscode-extension/src/webview/themes/ and registering it in themes/index.ts."
+          "enumDescriptions": [
+            "Near-monochrome dark — quiet / premium (default)",
+            "Soft pastel blue-grey — cream surfaces, retro pastel accents",
+            "Canopy Command — deep navy with signal accents (legacy)"
+          ],
+          "description": "Color theme for the canopy dashboard panel. Reload the panel after changing."
         }
       }
     }
@@ -252,11 +276,15 @@
     "test:watch": "jest --watch"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.4"
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5"
   },
   "devDependencies": {
     "@types/jest": "^29.5.0",
     "@types/node": "^20.11.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
     "@types/vscode": "^1.85.0",
     "@vscode/vsce": "^3.2.0",
     "esbuild": "^0.24.0",

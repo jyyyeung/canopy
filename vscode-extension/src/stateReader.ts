@@ -70,6 +70,11 @@ export interface CanopyToml {
   tracker_type: string;
   /** Per-repo `label` mappings from `[[repos]] label = "..."`, if any. */
   repo_labels: Record<string, string>;
+  /**
+   * `[workspace] max_worktrees = N`. 0 means unset — `actions/switch_preflight`
+   * defaults to 2 in that case (1 canonical + 2 warm = 3 live trees max).
+   */
+  max_worktrees: number;
 }
 
 interface CacheEntry<T> {
@@ -125,6 +130,17 @@ export class StateReader {
   /** Convenience: list of canopy-managed repo names. */
   repoNames(): string[] {
     return this.canopyToml().repo_names;
+  }
+
+  /**
+   * Effective warm-slot cap. 0 in canopy.toml means "unset" — the Python side
+   * defaults to 2 in `actions/switch_preflight.warm_slot_cap`; we mirror that
+   * here so the dashboard's "X / Y" pill matches what `switch` actually
+   * enforces.
+   */
+  maxWorktrees(): number {
+    const raw = this.canopyToml().max_worktrees;
+    return raw > 0 ? raw : 2;
   }
 
   /** Convenience: configured issue-provider name ("linear" / "github_issues" / ""). */
@@ -206,6 +222,7 @@ export function parseCanopyTomlMinimal(text: string): CanopyToml {
     repo_names: [],
     tracker_type: "",
     repo_labels: {},
+    max_worktrees: 0,
   };
   if (!text) return out;
 
@@ -227,6 +244,8 @@ export function parseCanopyTomlMinimal(text: string): CanopyToml {
   for (const { name, body } of sections) {
     if (name === "workspace") {
       out.workspace_name = matchKeyString(body, "name") ?? out.workspace_name;
+      const cap = matchKeyInt(body, "max_worktrees");
+      if (cap !== null) out.max_worktrees = cap;
     } else if (name === "[repos]") {
       const repoName = matchKeyString(body, "name");
       if (repoName) {
@@ -253,4 +272,16 @@ function matchKeyString(body: string, key: string): string | null {
   const re = new RegExp(`^\\s*${key}\\s*=\\s*["']([^"']*)["']\\s*$`, "m");
   const m = re.exec(cleaned);
   return m ? m[1] : null;
+}
+
+function matchKeyInt(body: string, key: string): number | null {
+  const cleaned = body
+    .split("\n")
+    .map((line) => line.replace(/#.*$/, "").trimEnd())
+    .join("\n");
+  const re = new RegExp(`^\\s*${key}\\s*=\\s*(-?\\d+)\\s*$`, "m");
+  const m = re.exec(cleaned);
+  if (!m) return null;
+  const n = Number.parseInt(m[1], 10);
+  return Number.isFinite(n) ? n : null;
 }

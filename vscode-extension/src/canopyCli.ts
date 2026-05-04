@@ -157,6 +157,216 @@ export class CanopyCli {
     return this.exec<TriageResult>(["triage", "--json"], { cacheTtlMs: 60_000, ...opts });
   }
 
+  /** `canopy feature list --json`. */
+  featureList(opts: ExecOptions = {}): Promise<FeatureListEntry[]> {
+    return this.exec<FeatureListEntry[]>(["feature", "list", "--json"], {
+      cacheTtlMs: 30_000, ...opts,
+    });
+  }
+
+  /** `canopy status --json` — workspace-wide cross-repo status. */
+  workspaceStatus(opts: ExecOptions = {}): Promise<WorkspaceStatus> {
+    return this.exec<WorkspaceStatus>(["status", "--json"], {
+      cacheTtlMs: 15_000, ...opts,
+    });
+  }
+
+  /** `canopy feature status <name> --json` — per-repo cross-feature status. */
+  featureStatus(feature: string, opts: ExecOptions = {}): Promise<FeatureStatus> {
+    return this.exec<FeatureStatus>(["feature", "status", feature, "--json"], {
+      cacheTtlMs: 15_000, ...opts,
+    });
+  }
+
+  /** `canopy feature diff <name> --json` — aggregated diff across repos. */
+  featureDiff(feature: string, opts: ExecOptions = {}): Promise<FeatureDiffResult> {
+    return this.exec<FeatureDiffResult>(["feature", "diff", feature, "--json"], {
+      cacheTtlMs: 30_000, ...opts,
+    });
+  }
+
+  /** `canopy comments <alias> --json` — temporally classified PR threads. */
+  reviewComments(alias: string, opts: ExecOptions = {}): Promise<ReviewCommentsResult> {
+    return this.exec<ReviewCommentsResult>(["comments", alias, "--json"], {
+      cacheTtlMs: 60_000, ...opts,
+    });
+  }
+
+  /** `canopy bot-status --feature <feature> --json`. */
+  botStatus(feature: string, opts: ExecOptions = {}): Promise<BotStatusResult> {
+    return this.exec<BotStatusResult>(
+      ["bot-status", "--feature", feature, "--json"],
+      { cacheTtlMs: 60_000, ...opts },
+    );
+  }
+
+  /** `canopy issue <alias> --json` — provider-native issue body + meta. */
+  issueGet(alias: string, opts: ExecOptions = {}): Promise<IssueResult> {
+    return this.exec<IssueResult>(["issue", alias, "--json"], {
+      cacheTtlMs: 5 * 60_000, ...opts,
+    });
+  }
+
+  /**
+   * `canopy switch <feature> --json` — promote a feature to the canonical slot.
+   *
+   * Write op: drops the entire read cache after success so the next render
+   * pulls fresh data (active_feature, per-repo state, triage all change).
+   */
+  async switchFeature(
+    feature: string,
+    opts: SwitchOptions = {},
+  ): Promise<SwitchResult> {
+    const args = ["switch", feature];
+    if (opts.releaseCurrent) args.push("--release-current");
+    if (opts.noEvict) args.push("--no-evict");
+    if (opts.evict) args.push("--evict", opts.evict);
+    args.push("--json");
+    const result = await this.exec<SwitchResult>(args);
+    this.invalidateCache();
+    return result;
+  }
+
+  /**
+   * `canopy config <key> <value> --json` — write a workspace setting.
+   *
+   * Used by the Raise-cap affordance to bump `max_worktrees`. Caller passes
+   * the value as a string (the CLI coerces to the registered type).
+   */
+  async setConfig(key: string, value: string): Promise<{ key: string; value: unknown }> {
+    const result = await this.exec<{ key: string; value: unknown }>([
+      "config", key, value, "--json",
+    ]);
+    this.invalidateCache();
+    return result;
+  }
+
+  /** `canopy ship --feature <name> --json` — open/update PRs across repos (M8). */
+  async ship(opts: ShipOptions): Promise<ShipResult> {
+    const args = ["ship"];
+    if (opts.feature) args.push("--feature", opts.feature);
+    if (opts.repos?.length) args.push("--repos", opts.repos.join(","));
+    if (opts.draft) args.push("--draft");
+    if (opts.reviewers?.length) args.push("--reviewers", opts.reviewers.join(","));
+    if (opts.base) args.push("--base", opts.base);
+    if (opts.dryRun) args.push("--dry-run");
+    args.push("--json");
+    const result = await this.exec<ShipResult>(args, { timeoutMs: 5 * 60_000 });
+    this.invalidateCache();
+    return result;
+  }
+
+  /** `canopy draft-replies <alias> --json` — addressed-comment drafts (M9). */
+  draftReplies(
+    alias: string, opts: { includeLikelyResolved?: boolean } = {},
+  ): Promise<DraftRepliesResult> {
+    const args = ["draft-replies", alias];
+    if (opts.includeLikelyResolved) args.push("--include-likely-resolved");
+    args.push("--json");
+    return this.exec<DraftRepliesResult>(args, { cacheTtlMs: 60_000 });
+  }
+
+  /** `canopy conflicts --json` — cross-feature file-overlap (M12). */
+  conflicts(opts: ConflictsOptions = {}): Promise<ConflictsResult> {
+    const args = ["conflicts"];
+    if (opts.feature) args.push("--feature", opts.feature);
+    if (opts.other) args.push("--with", opts.other);
+    if (opts.includeCold) args.push("--include-cold");
+    if (opts.lineLevel) args.push("--lines");
+    args.push("--json");
+    return this.exec<ConflictsResult>(args, { cacheTtlMs: 60_000 });
+  }
+
+  /** `canopy worktree-bootstrap <feature> --json` — env/deps/IDE workspace (M6). */
+  async worktreeBootstrap(
+    feature: string,
+    opts: { force?: boolean; step?: "env" | "deps" | "ide" } = {},
+  ): Promise<BootstrapResult> {
+    const args = ["worktree-bootstrap", feature];
+    if (opts.force) args.push("--force");
+    if (opts.step) args.push("--step", opts.step);
+    args.push("--json");
+    const result = await this.exec<BootstrapResult>(args, { timeoutMs: 10 * 60_000 });
+    this.invalidateCache();
+    return result;
+  }
+
+  /** `canopy pr-checks <alias> --json` — CI rollup (M10). */
+  prChecks(alias: string): Promise<PrChecksResult> {
+    return this.exec<PrChecksResult>(
+      ["pr-checks", alias, "--json"],
+      { cacheTtlMs: 30_000 },
+    );
+  }
+
+  /**
+   * `canopy preflight [<feature>] --json` — stage + run hooks.
+   *
+   * Pass a feature explicitly so we don't depend on the CLI's working-
+   * directory context detection (which fires from the workspace root in
+   * the extension and would not match the user's intent).
+   */
+  async preflight(feature?: string): Promise<PreflightResult> {
+    const args = ["preflight"];
+    if (feature) args.push(feature);
+    args.push("--json");
+    const result = await this.exec<PreflightResult>(args, { timeoutMs: 5 * 60_000 });
+    this.invalidateCache();
+    return result;
+  }
+
+  /** `canopy commit ... --json`. Wraps the multi-repo commit primitive. */
+  async commit(opts: CommitOptions): Promise<CommitResult> {
+    const args = ["commit"];
+    if (opts.feature) args.push("--feature", opts.feature);
+    if (opts.repos?.length) args.push("--repos", opts.repos.join(","));
+    if (opts.noHooks) args.push("--no-hooks");
+    if (opts.amend) args.push("--amend");
+    if (opts.address) args.push("--address", opts.address);
+    if (opts.message !== undefined) args.push("-m", opts.message);
+    if (opts.paths?.length) args.push("--paths", ...opts.paths);
+    args.push("--json");
+    const result = await this.exec<CommitResult>(args, { timeoutMs: 5 * 60_000 });
+    this.invalidateCache();
+    return result;
+  }
+
+  /** `canopy push ... --json` — feature-scoped multi-repo push. */
+  async push(opts: PushOptions): Promise<PushResult> {
+    const args = ["push"];
+    if (opts.feature) args.push("--feature", opts.feature);
+    if (opts.repos?.length) args.push("--repos", opts.repos.join(","));
+    if (opts.setUpstream) args.push("--set-upstream");
+    if (opts.forceWithLease) args.push("--force-with-lease");
+    if (opts.dryRun) args.push("--dry-run");
+    args.push("--json");
+    const result = await this.exec<PushResult>(args, { timeoutMs: 2 * 60_000 });
+    this.invalidateCache();
+    return result;
+  }
+
+  /** `canopy stash-save-feature --feature <name> --json`. */
+  async stashSaveFeature(
+    feature: string,
+    message?: string,
+  ): Promise<unknown> {
+    const args = ["stash-save-feature", "--feature", feature];
+    if (message) args.push("-m", message);
+    args.push("--json");
+    const result = await this.exec(args);
+    this.invalidateCache();
+    return result;
+  }
+
+  /** `canopy stash-pop-feature --feature <name> --json`. */
+  async stashPopFeature(feature: string): Promise<unknown> {
+    const result = await this.exec([
+      "stash-pop-feature", "--feature", feature, "--json",
+    ]);
+    this.invalidateCache();
+    return result;
+  }
+
   // ── Internals ──────────────────────────────────────────────────────────
 
   private spawn(
@@ -333,4 +543,320 @@ export interface TriageResult {
   author?: string;
   canonical_feature: string | null;
   features: TriageFeature[];
+}
+
+export interface SwitchOptions {
+  /** Wind down the previously canonical feature to cold (with stash). */
+  releaseCurrent?: boolean;
+  /** Refuse to evict an LRU warm worktree if the cap would be exceeded. */
+  noEvict?: boolean;
+  /** Evict this specific warm feature instead of the LRU candidate. */
+  evict?: string;
+}
+
+export interface SwitchResult {
+  feature: string;
+  mode: "active_rotation" | "wind_down" | string;
+  per_repo_paths: Record<string, string>;
+  previously_canonical?: string;
+  eviction?: {
+    feature: string;
+    repos: Array<{ repo: string; stashed: boolean }>;
+  };
+  branches_created?: Array<{ repo: string; branch: string; base: string }>;
+  migration?: { ran: boolean; canonical_detected?: string | null };
+}
+
+// ── Result shapes added in Phase 3 ─────────────────────────────────────
+
+export interface FeatureListEntry {
+  name: string;
+  repos: string[];
+  status?: string;
+  linear_issue?: string | null;
+  linear_url?: string | null;
+  linear_title?: string | null;
+  branches?: Record<string, string>;
+  worktree_paths?: Record<string, string>;
+  use_worktrees?: boolean;
+  repo_states?: Record<string, Record<string, unknown>>;
+}
+
+export interface WorkspaceStatusRepo {
+  name: string;
+  current_branch?: string;
+  head_sha?: string;
+  is_dirty?: boolean;
+  dirty_count?: number;
+  ahead_of_default?: number;
+  behind_default?: number;
+}
+
+export interface WorkspaceStatus {
+  name?: string;
+  root?: string;
+  repos: WorkspaceStatusRepo[];
+  active_features?: string[];
+}
+
+export interface FeatureStatusRepo {
+  branch?: string;
+  has_branch?: boolean;
+  is_dirty?: boolean;
+  dirty_count?: number;
+  ahead?: number;
+  behind?: number;
+  changed_file_count?: number;
+  pr_url?: string;
+  pr_number?: number;
+}
+
+export interface FeatureStatus {
+  feature: string;
+  repos: Record<string, FeatureStatusRepo>;
+  linear_issue?: string | null;
+}
+
+export interface FeatureDiffResult {
+  feature: string;
+  repos: Record<string, {
+    files?: Array<{ path: string; additions: number; deletions: number }>;
+    diff?: string;
+    files_changed?: number;
+    additions?: number;
+    deletions?: number;
+  }>;
+  totals?: { files: number; additions: number; deletions: number };
+}
+
+export interface ReviewThread {
+  id?: string;
+  author?: string;
+  body?: string;
+  path?: string;
+  line?: number;
+  url?: string;
+  created_at?: string;
+  is_bot?: boolean;
+}
+
+export interface ReviewCommentsRepo {
+  pr_number?: number;
+  pr_url?: string;
+  actionable_threads?: ReviewThread[];
+  likely_resolved_threads?: ReviewThread[];
+  resolved_thread_count?: number;
+}
+
+export interface ReviewCommentsResult {
+  actionable_count: number;
+  likely_resolved_count: number;
+  resolved_thread_count: number;
+  repos: Record<string, ReviewCommentsRepo>;
+}
+
+export interface BotStatusResult {
+  feature: string;
+  bot_threads_total?: number;
+  unresolved?: Array<{ id: string; author?: string; path?: string; body?: string }>;
+  resolved?: Array<{ id: string; resolved_at?: string; sha?: string; repo?: string }>;
+}
+
+export interface IssueResult {
+  id?: string;
+  identifier?: string;
+  title?: string;
+  description?: string;
+  state?: string;
+  url?: string;
+  assignee?: string | null;
+  labels?: string[];
+  priority?: string | null;
+  raw?: unknown;
+}
+
+export interface PreflightRepoResult {
+  status: "ok" | "clean" | "hooks_failed" | "error" | string;
+  hooks?: { passed: boolean; output?: string } | null;
+  error?: string;
+}
+
+export interface PreflightResult {
+  all_passed?: boolean;
+  feature?: string;
+  results?: Record<string, PreflightRepoResult>;
+}
+
+export interface CommitOptions {
+  feature?: string;
+  message?: string;
+  repos?: string[];
+  noHooks?: boolean;
+  amend?: boolean;
+  address?: string;
+  paths?: string[];
+}
+
+export interface CommitRepoResult {
+  status: "ok" | "nothing" | "hooks_failed" | "failed" | string;
+  sha?: string;
+  files_changed?: number;
+  amended?: boolean;
+  hook_output?: string;
+  reason?: string;
+}
+
+export interface CommitResult {
+  feature: string;
+  results: Record<string, CommitRepoResult>;
+  addressed?: {
+    comment_id: string;
+    repo?: string;
+    sha?: string;
+    recorded?: boolean;
+    reason?: string;
+  };
+}
+
+export interface PushOptions {
+  feature?: string;
+  repos?: string[];
+  setUpstream?: boolean;
+  forceWithLease?: boolean;
+  dryRun?: boolean;
+}
+
+export interface PushRepoResult {
+  status: "ok" | "up_to_date" | "rejected" | "failed" | string;
+  pushed_count?: number;
+  ref?: string;
+  set_upstream?: boolean;
+  dry_run?: boolean;
+  reason?: string;
+}
+
+export interface PushResult {
+  feature: string;
+  results: Record<string, PushRepoResult>;
+}
+
+// ── M6 / M8 / M9 / M10 / M12 result shapes ─────────────────────────────
+
+export interface ShipOptions {
+  feature?: string;
+  repos?: string[];
+  draft?: boolean;
+  reviewers?: string[];
+  base?: string;
+  dryRun?: boolean;
+}
+
+export interface ShipRepoResult {
+  status:
+    | "opened" | "up_to_date" | "diverged" | "closed" | "skipped"
+    | "would_open" | "would_update_or_skip" | "failed" | string;
+  pr_number?: number;
+  url?: string;
+  reason?: string;
+  warning?: string;
+  draft?: boolean;
+  ahead?: number;
+  base?: string;
+}
+
+export interface ShipResult {
+  feature: string;
+  results: Record<string, ShipRepoResult>;
+  cross_repo_links_updated: boolean;
+}
+
+export interface DraftReplyEntry {
+  comment_id?: string;
+  comment_url?: string;
+  original_comment: {
+    author?: string;
+    path?: string;
+    line?: number;
+    body?: string;
+  };
+  addressing_commits: Array<{ sha: string; subject: string; date: string }>;
+  draft_reply: string;
+  confidence: "high" | "medium" | "low" | string;
+}
+
+export interface DraftRepliesResult {
+  alias: string;
+  addressed_total: number;
+  unaddressed_total: number;
+  repos: Record<string, {
+    pr_number?: number;
+    pr_url?: string;
+    addressed: DraftReplyEntry[];
+    unaddressed: Array<Record<string, unknown>>;
+  }>;
+}
+
+export interface ConflictsOptions {
+  feature?: string;
+  other?: string;
+  includeCold?: boolean;
+  lineLevel?: boolean;
+}
+
+export interface ConflictPair {
+  feature_a: string;
+  feature_b: string;
+  overlap: Record<string, {
+    files: string[];
+    generated_files?: string[];
+    lines_a_only?: number;
+    lines_b_only?: number;
+    lines_both?: number;
+  }>;
+  severity: "high" | "medium" | "low" | string;
+  suggestion: string;
+}
+
+export interface ConflictsResult {
+  features: string[];
+  pairs: ConflictPair[];
+}
+
+export interface BootstrapStep {
+  status: "ok" | "skipped" | "failed" | "missing_source" | "no_ide_configured" | string;
+  files_copied?: string[];
+  files_skipped?: string[];
+  files_missing?: string[];
+  exit_code?: number;
+  duration_ms?: number;
+  stderr_tail?: string;
+  reason?: string;
+  path?: string;
+}
+
+export interface BootstrapResult {
+  feature: string;
+  results: Record<string, { env: BootstrapStep; deps: BootstrapStep }>;
+  ide: BootstrapStep;
+}
+
+export interface CiStatus {
+  status: "passing" | "failing" | "pending" | "no_checks" | string;
+  passed?: number;
+  failing?: number;
+  pending?: number;
+  skipped?: number;
+  required_failing?: string[];
+  required_pending?: string[];
+  details_url?: string;
+}
+
+export interface PrChecksResult {
+  alias: string;
+  results: Array<{
+    repo: string;
+    pr_number: number;
+    ci_status: CiStatus;
+    checks: Array<Record<string, unknown>>;
+  }>;
 }
