@@ -208,6 +208,16 @@ def _per_repo_facts(
             if pr:
                 facts["pr"] = pr
                 facts["review_decision"] = pr.get("review_decision", "")
+                # M10: CI check rollup. Best-effort — failures here
+                # default to ``no_checks`` rather than blocking the
+                # whole feature_state read.
+                try:
+                    ci_status, _raw = gh.get_pr_checks(
+                        workspace.config.root, owner, slug, pr["number"],
+                    )
+                    facts["ci_status"] = ci_status
+                except Exception:
+                    facts["ci_status"] = {"status": "no_checks"}
                 try:
                     comments, _ = gh.get_review_comments(
                         workspace.config.root, owner, slug, pr["number"],
@@ -281,6 +291,10 @@ def _summarize(per_repo: dict[str, dict]) -> dict[str, Any]:
         r: f.get("review_decision", "") for r, f in per_repo.items() if f.get("pr")
     }
     pr_count = sum(1 for f in per_repo.values() if f.get("pr"))
+    ci_per_repo = {
+        r: f["ci_status"] for r, f in per_repo.items()
+        if f.get("pr") and f.get("ci_status")
+    }
     return {
         "dirty_repos": dirty_repos,
         "ahead_repos": ahead_repos,
@@ -293,7 +307,23 @@ def _summarize(per_repo: dict[str, dict]) -> dict[str, Any]:
         "repos": {r: {k: v for k, v in f.items() if k not in ("pr", "actionable_bot_threads")}
                    for r, f in per_repo.items()},
         "prs": {r: f["pr"] for r, f in per_repo.items() if f.get("pr")},
+        # M10: per-repo CI rollup + a feature-level aggregate. The
+        # aggregate picks the worst across repos so a feature whose api
+        # is passing but ui is failing reports as "failing."
+        "ci_per_repo": ci_per_repo,
+        "ci_aggregate": _aggregate_ci(ci_per_repo),
     }
+
+
+def _aggregate_ci(ci_per_repo: dict[str, dict]) -> str:
+    """Worst-state-wins reduction across repos (M10)."""
+    if not ci_per_repo:
+        return "no_checks"
+    statuses = {(c.get("status") or "no_checks") for c in ci_per_repo.values()}
+    for severe in ("failing", "pending", "passing"):
+        if severe in statuses:
+            return severe
+    return "no_checks"
 
 
 def _preflight_summary(entry, fresh: bool) -> dict[str, Any]:
@@ -392,8 +422,42 @@ def _decide_state(
         ]
         return "no_prs", next_actions, warnings
 
+    ci_aggregate = summary.get("ci_aggregate", "no_checks")
+    ci_per_repo = summary.get("ci_per_repo") or {}
     non_empty = {d for d in decisions.values() if d}
     if non_empty and non_empty <= {"APPROVED"}:
+        # M10 CI matrix: approved + CI is the merge gate.
+        if ci_aggregate == "failing":
+            failing_names = sorted(
+                name for repo, ci in ci_per_repo.items()
+                for name in (ci.get("required_failing") or [])
+            )
+            next_actions = [
+                {"action": "investigate_ci",
+                 "args": {"feature": feature_name},
+                 "primary": True, "label": "Investigate failing CI",
+                 "preview": ", ".join(failing_names) or "see Checks tab"},
+                {"action": "comments", "args": {"feature": feature_name},
+                 "primary": False, "label": "View comments"},
+            ]
+            # Failing CI overrides the "approved" badge — same intent as
+            # a CHANGES_REQUESTED review.
+            return "needs_work", next_actions, warnings
+        if ci_aggregate == "pending":
+            pending_names = sorted(
+                name for repo, ci in ci_per_repo.items()
+                for name in (ci.get("required_pending") or [])
+            )
+            next_actions = [
+                {"action": "wait_for_ci",
+                 "args": {"feature": feature_name},
+                 "primary": True, "label": "Waiting on CI",
+                 "preview": ", ".join(pending_names) or "checks running"},
+                {"action": "refresh", "args": {"feature": feature_name},
+                 "primary": False, "label": "Refresh"},
+            ]
+            return "awaiting_ci", next_actions, warnings
+
         next_actions = [
             {"action": "merge", "args": {"feature": feature_name},
              "primary": True, "label": "Merge",

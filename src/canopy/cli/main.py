@@ -2622,6 +2622,284 @@ def cmd_drift(args: argparse.Namespace) -> None:
         console.print()
 
 
+def cmd_pr_checks(args: argparse.Namespace) -> None:
+    """Fetch CI check runs for a PR alias (M10)."""
+    from ..actions.aliases import resolve_pr_targets
+    from ..integrations import github as gh
+    from .ui import console
+
+    workspace = _load_workspace()
+    targets = resolve_pr_targets(workspace, args.alias)
+    results = []
+    for t in targets:
+        rollup, raw = gh.get_pr_checks(
+            workspace.config.root, t.owner, t.repo_slug, t.pr_number,
+        )
+        results.append({
+            "repo": t.repo,
+            "pr_number": t.pr_number,
+            "ci_status": rollup,
+            "checks": raw,
+        })
+
+    if args.json:
+        _print_json({"alias": args.alias, "results": results})
+        return
+
+    console.print()
+    for r in results:
+        ci = r["ci_status"]
+        glyph = {
+            "passing": "[success]✓[/]",
+            "failing": "[error]✗[/]",
+            "pending": "[warning]·[/]",
+            "no_checks": "[muted]·[/]",
+        }.get(ci.get("status"), "?")
+        console.print(
+            f"  [repo]{r['repo']}[/]  PR #{r['pr_number']}  "
+            f"{glyph} {ci.get('status', '')}  "
+            f"[muted]passed: {ci.get('passed', 0)}, failing: {ci.get('failing', 0)}, "
+            f"pending: {ci.get('pending', 0)}[/]"
+        )
+        if ci.get("required_failing"):
+            console.print(
+                f"    [error]failing:[/] {', '.join(ci['required_failing'])}"
+            )
+        if ci.get("details_url"):
+            console.print(f"    [muted]{ci['details_url']}[/]")
+    console.print()
+
+
+def cmd_worktree_bootstrap(args: argparse.Namespace) -> None:
+    """Bootstrap a feature's worktrees: env-files, deps, IDE workspace (M6)."""
+    from ..actions.bootstrap import ALLOWED_STEPS, bootstrap_feature
+    from ..actions.errors import ActionError
+    from .render import render_blocker
+    from .ui import console, spinner
+
+    workspace = _load_workspace()
+    steps_arg = getattr(args, "step", None)
+    steps = [steps_arg] if steps_arg else None
+
+    try:
+        with spinner("Bootstrapping…"):
+            result = bootstrap_feature(
+                workspace, args.feature,
+                force=getattr(args, "force", False),
+                steps=steps,
+            )
+    except ActionError as err:
+        if args.json:
+            _print_json(err.to_dict())
+        else:
+            render_blocker(err, action="worktree-bootstrap")
+        sys.exit(1)
+
+    if args.json:
+        _print_json(result)
+        return
+
+    console.print()
+    console.print(f"  [feature]{result['feature']}[/]")
+    for repo, r in result["results"].items():
+        console.print(f"\n    [repo]{repo}[/]")
+        env = r["env"]
+        env_glyph = {"ok": "[success]✓[/]", "skipped": "[muted]·[/]",
+                     "missing_source": "[warning]·[/]"}.get(env["status"], "?")
+        copied = env.get("files_copied", [])
+        env_summary = f"{len(copied)} file(s)" if copied else env.get("reason", env["status"])
+        console.print(f"      env  {env_glyph}  {env_summary}")
+        deps = r["deps"]
+        deps_glyph = {"ok": "[success]✓[/]", "failed": "[error]✗[/]",
+                       "skipped": "[muted]·[/]"}.get(deps["status"], "?")
+        deps_extra = ""
+        if deps["status"] == "ok":
+            deps_extra = f"  [muted]({deps.get('duration_ms', 0)}ms)[/]"
+        elif deps["status"] == "failed":
+            deps_extra = f"  [error]exit {deps.get('exit_code', '?')}[/]"
+        elif deps.get("reason"):
+            deps_extra = f"  [muted]{deps['reason']}[/]"
+        console.print(f"      deps {deps_glyph}{deps_extra}")
+    ide = result["ide"]
+    ide_glyph = {"ok": "[success]✓[/]", "skipped": "[muted]·[/]",
+                 "no_ide_configured": "[muted]·[/]"}.get(ide["status"], "?")
+    if ide.get("path"):
+        console.print(f"\n    ide  {ide_glyph}  [muted]{ide['path']}[/]")
+    elif ide.get("reason"):
+        console.print(f"\n    ide  {ide_glyph}  [muted]{ide['reason']}[/]")
+    else:
+        console.print(f"\n    ide  {ide_glyph}  [muted]{ide['status']}[/]")
+    console.print()
+
+
+def cmd_ship(args: argparse.Namespace) -> None:
+    """Open or update one PR per repo in the canonical feature (M8 / Wave 2.4)."""
+    from ..actions.errors import ActionError
+    from ..actions.ship import ship as ship_impl
+    from .render import render_blocker
+    from .ui import console, spinner
+
+    workspace = _load_workspace()
+    spin_msg = "Dry-run ship…" if args.dry_run else "Shipping…"
+    try:
+        with spinner(spin_msg):
+            result = ship_impl(
+                workspace,
+                feature=args.feature,
+                repos=_split_csv(args.repos),
+                draft=args.draft,
+                reviewers=_split_csv(args.reviewers),
+                dry_run=args.dry_run,
+                base=args.base,
+            )
+    except ActionError as err:
+        if args.json:
+            _print_json(err.to_dict())
+        else:
+            render_blocker(err, action="ship")
+        sys.exit(1)
+
+    if args.json:
+        _print_json(result)
+        return
+
+    console.print()
+    console.print(f"  [feature]{result['feature']}[/]")
+    for repo, r in result["results"].items():
+        status = r["status"]
+        if status == "opened":
+            console.print(
+                f"    [success]✓[/] [repo]{repo}[/]  opened PR #{r['pr_number']}  "
+                f"[muted]{r.get('url', '')}[/]"
+                + ("  [muted](draft)[/]" if r.get("draft") else "")
+            )
+        elif status == "up_to_date":
+            console.print(
+                f"    [muted]·[/] [repo]{repo}[/]  PR #{r['pr_number']} up to date"
+            )
+        elif status == "diverged":
+            console.print(
+                f"    [warning]⚠[/] [repo]{repo}[/]  PR #{r['pr_number']} diverged "
+                f"[muted]{r.get('warning', '')}[/]"
+            )
+        elif status == "closed":
+            console.print(
+                f"    [warning]·[/] [repo]{repo}[/]  PR #{r['pr_number']} closed/merged "
+                f"[muted]{r.get('reason', '')}[/]"
+            )
+        elif status == "skipped":
+            console.print(
+                f"    [muted]·[/] [repo]{repo}[/]  skipped — {r.get('reason', '')}"
+            )
+        elif status.startswith("would_"):
+            console.print(
+                f"    [muted]·[/] [repo]{repo}[/]  {status} (dry-run)"
+            )
+        else:
+            console.print(f"    [error]✗[/] [repo]{repo}[/]  {r.get('reason', status)}")
+    if result.get("cross_repo_links_updated"):
+        console.print()
+        console.print("    [muted]cross-repo PR descriptions updated with sibling links[/]")
+    console.print()
+
+
+def cmd_draft_replies(args: argparse.Namespace) -> None:
+    """Auto-draft "Done in <sha>" replies for addressed PR comments (M9)."""
+    from ..actions.draft_replies import draft_replies
+    from .ui import console
+
+    workspace = _load_workspace()
+    result = draft_replies(
+        workspace, args.alias,
+        include_likely_resolved=getattr(args, "include_likely_resolved", False),
+    )
+
+    if args.json:
+        _print_json(result)
+        return
+
+    console.print()
+    console.print(
+        f"  [header]drafts: {result['addressed_total']} addressed, "
+        f"{result['unaddressed_total']} unaddressed[/]"
+    )
+    for repo, info in result["repos"].items():
+        console.print()
+        console.print(
+            f"  [repo]{repo}[/]  PR #{info['pr_number']}  [muted]{info.get('pr_url', '')}[/]"
+        )
+        for draft in info["addressed"]:
+            conf = draft["confidence"]
+            tag = {"high": "[success]✓[/]", "medium": "[warning]·[/]",
+                   "low": "[muted]·[/]"}.get(conf, "·")
+            orig = draft["original_comment"]
+            location = (
+                f"{orig['path']}:{orig['line']}" if orig.get("path") else "(general)"
+            )
+            console.print(
+                f"    {tag} [muted]{location}[/]  {orig.get('author', '')}  "
+                f"[muted]({conf})[/]"
+            )
+            console.print(f"      → [info]{draft['draft_reply']}[/]")
+        if not info["addressed"]:
+            console.print(
+                f"    [muted]no draftable replies; "
+                f"{len(info['unaddressed'])} unaddressed[/]"
+            )
+    console.print()
+
+
+def cmd_conflicts(args: argparse.Namespace) -> None:
+    """Cross-feature file-overlap detection (M12)."""
+    from ..actions.conflicts import find_conflicts
+    from .ui import console
+
+    workspace = _load_workspace()
+    result = find_conflicts(
+        workspace,
+        feature=getattr(args, "feature", None),
+        other=getattr(args, "with_", None),
+        include_cold=getattr(args, "include_cold", False),
+        line_level=getattr(args, "lines", False),
+    )
+
+    if args.json:
+        _print_json(result)
+        return
+
+    pairs = result["pairs"]
+    console.print()
+    console.print(f"  [header]Conflicts ({len(pairs)} pair{'' if len(pairs) == 1 else 's'})[/]")
+    console.print(f"  {'─' * 60}")
+    if not pairs:
+        console.print("  [muted]no overlaps detected[/]")
+        console.print()
+        return
+
+    severity_glyph = {
+        "high": "[error]⚠[/]",
+        "medium": "[warning]·[/]",
+        "low": "[muted]·[/]",
+    }
+    for pair in pairs:
+        glyph = severity_glyph.get(pair["severity"], "·")
+        console.print(
+            f"\n  {glyph} [feature]{pair['feature_a']}[/] ↔ [feature]{pair['feature_b']}[/]  "
+            f"[muted]{pair['severity']}[/]"
+        )
+        for repo, entry in pair["overlap"].items():
+            files = entry["files"]
+            file_list = ", ".join(files[:3])
+            if len(files) > 3:
+                file_list += f" (+{len(files) - 3} more)"
+            line_bit = ""
+            if "lines_both" in entry and entry["lines_both"] > 0:
+                line_bit = f", {entry['lines_both']} lines overlapping"
+            console.print(f"    [repo]{repo}[/]  {file_list}{line_bit}")
+        console.print(f"    [muted]suggestion: {pair['suggestion']}[/]")
+    console.print()
+
+
 def cmd_doctor(args: argparse.Namespace) -> None:
     """Diagnose workspace + install integrity; optionally repair."""
     from ..actions.doctor import doctor
@@ -3079,6 +3357,69 @@ def main() -> None:
     triage_p.add_argument("--json", action="store_true", help="Output as JSON")
 
     # drift
+    pr_checks_p = subparsers.add_parser(
+        "pr-checks",
+        help="CI check rollup for a PR alias (M10)",
+    )
+    pr_checks_p.add_argument("alias", help="Feature alias, <repo>#<n>, or PR URL")
+    pr_checks_p.add_argument("--json", action="store_true", help="Output as JSON")
+
+    bootstrap_p = subparsers.add_parser(
+        "worktree-bootstrap",
+        help="Bootstrap a feature's worktrees (env files, deps, IDE workspace) — M6",
+    )
+    bootstrap_p.add_argument("feature", help="Feature alias to bootstrap")
+    bootstrap_p.add_argument("--force", action="store_true",
+                              help="Overwrite existing destination env files")
+    bootstrap_p.add_argument("--step", choices=["env", "deps", "ide"], default=None,
+                              help="Run only one step instead of all three")
+    bootstrap_p.add_argument("--json", action="store_true", help="Output as JSON")
+
+    ship_p = subparsers.add_parser(
+        "ship",
+        help="Open or update one PR per repo in the canonical feature (M8 / Wave 2.4)",
+    )
+    ship_p.add_argument("--feature", default=None,
+                          help="Feature alias (defaults to canonical)")
+    ship_p.add_argument("--repo", "--repos", dest="repos", default=None,
+                          help="Comma-separated repo names to scope the ship")
+    ship_p.add_argument("--draft", action="store_true",
+                          help="Open PRs as drafts (initial open only)")
+    ship_p.add_argument("--reviewers", default=None,
+                          help="Comma-separated GitHub handles to request review from")
+    ship_p.add_argument("--base", default=None,
+                          help="Override base branch (default: each repo's default_branch)")
+    ship_p.add_argument("--dry-run", action="store_true",
+                          help="Enumerate without firing pushes or opening PRs")
+    ship_p.add_argument("--json", action="store_true", help="Output as JSON")
+
+    draft_replies_p = subparsers.add_parser(
+        "draft-replies",
+        help="Auto-draft replies for addressed PR review comments (M9)",
+    )
+    draft_replies_p.add_argument(
+        "alias", help="Feature alias, <repo>#<n>, or PR URL",
+    )
+    draft_replies_p.add_argument(
+        "--include-likely-resolved", action="store_true",
+        help="Also draft for the temporal classifier's likely_resolved set (low confidence)",
+    )
+    draft_replies_p.add_argument("--json", action="store_true", help="Output as JSON")
+
+    conflicts_p = subparsers.add_parser(
+        "conflicts",
+        help="Cross-feature file-overlap detection (M12)",
+    )
+    conflicts_p.add_argument("--feature", default=None,
+                              help="Scope to pairs involving this feature")
+    conflicts_p.add_argument("--with", dest="with_", default=None,
+                              help="Further scope to <feature> vs <other>")
+    conflicts_p.add_argument("--include-cold", action="store_true",
+                              help="Also scan cold features (default: active only)")
+    conflicts_p.add_argument("--lines", action="store_true",
+                              help="Compute line-range overlap (slower; downgrades to medium when files overlap but lines don't)")
+    conflicts_p.add_argument("--json", action="store_true", help="Output as JSON")
+
     drift_p = subparsers.add_parser(
         "drift",
         help="Show alignment between recorded HEADs and active feature lanes",
@@ -3221,6 +3562,11 @@ def main() -> None:
         "state": cmd_state,
         "setup-agent": cmd_setup_agent,
         "doctor": cmd_doctor,
+        "conflicts": cmd_conflicts,
+        "draft-replies": cmd_draft_replies,
+        "ship": cmd_ship,
+        "worktree-bootstrap": cmd_worktree_bootstrap,
+        "pr-checks": cmd_pr_checks,
     }
 
     if args.command == "feature":

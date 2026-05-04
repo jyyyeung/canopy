@@ -420,6 +420,42 @@ def diff_stat(repo_path: Path, ref_a: str, ref_b: str) -> dict:
     return result
 
 
+def log_for_path(
+    repo_path: Path, since_sha: str, path: str, *, follow: bool = True,
+) -> list[dict]:
+    """Commits that touched ``path`` since ``since_sha`` (exclusive).
+
+    Drives M9 ``draft_replies`` — given a PR review comment anchored at
+    ``since_sha`` for a file, this returns every later commit on the
+    current branch that touched the file. An empty list means the
+    comment is unaddressed (file untouched since the comment).
+
+    ``follow=True`` (the default) tracks renames so a reply to a comment
+    on a renamed file still surfaces the renaming commit.
+
+    Returns a list of ``{sha, subject, date}`` (ISO-8601 author date).
+    """
+    args = ["log", f"{since_sha}..HEAD", "--pretty=format:%H|%s|%aI"]
+    if follow:
+        args.append("--follow")
+    args += ["--", path]
+    try:
+        output = _run_ok(args, cwd=repo_path)
+    except GitError:
+        return []
+    out: list[dict] = []
+    for line in output.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("|", 2)
+        if len(parts) != 3:
+            continue
+        sha, subject, date = parts
+        out.append({"sha": sha, "subject": subject, "date": date})
+    return out
+
+
 def log_oneline(repo_path: Path, ref_range: str, max_count: int = 20) -> list[str]:
     """Get one-line log entries for a ref range."""
     output = _run_ok(

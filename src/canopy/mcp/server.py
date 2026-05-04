@@ -603,6 +603,146 @@ def doctor(
 
 
 @mcp.tool()
+def pr_checks(alias: str) -> dict:
+    """Fetch CI check runs for a PR alias (M10).
+
+    ``alias`` is the universal-resolved form: feature alias,
+    ``<repo>#<n>``, or PR URL. Returns the rolled-up status plus the raw
+    per-check list — useful when the rolled-up ``ci_status`` on
+    ``feature_state.repos[*].pr`` isn't enough.
+    """
+    from ..actions.aliases import resolve_pr_targets
+    from ..integrations import github as gh
+
+    ws = _get_workspace()
+    targets = resolve_pr_targets(ws, alias)
+    out = []
+    for t in targets:
+        rollup, raw = gh.get_pr_checks(
+            ws.config.root, t.owner, t.repo_slug, t.pr_number,
+        )
+        out.append({
+            "repo": t.repo,
+            "pr_number": t.pr_number,
+            "ci_status": rollup,
+            "checks": raw,
+        })
+    return {"alias": alias, "results": out}
+
+
+@mcp.tool()
+def worktree_bootstrap(
+    feature: str,
+    force: bool = False,
+    steps: list[str] | None = None,
+) -> dict:
+    """Bootstrap a feature's worktrees — env-files, deps, IDE workspace (M6).
+
+    Three optional steps, off by default unless the matching config is
+    set in canopy.toml: env-file copy from main checkout into the
+    worktree, dep install via per-repo ``install_cmd``, and a
+    ``.canopy/workspaces/<feature>.code-workspace`` file when
+    ``[workspace] ide = "vscode"`` is set.
+
+    Args:
+        feature: feature alias.
+        force: overwrite existing destination env files.
+        steps: subset of {"env", "deps", "ide"} to run; default = all three.
+    """
+    from ..actions.bootstrap import bootstrap_feature
+
+    ws = _get_workspace()
+    return bootstrap_feature(ws, feature, force=force, steps=steps)
+
+
+@mcp.tool()
+def ship(
+    feature: str | None = None,
+    repos: list[str] | None = None,
+    draft: bool = False,
+    reviewers: list[str] | None = None,
+    dry_run: bool = False,
+    base: str | None = None,
+) -> dict:
+    """Open or update one PR per repo in the canonical feature (M8 / Wave 2.4).
+
+    Per-repo recipe: ensure-pushed → ensure-PR-exists. Cross-repo body
+    refresh runs second so each PR description links to its siblings.
+
+    Args:
+        feature: feature alias. Defaults to the canonical slot.
+        repos: optional repo filter within the feature scope.
+        draft: open PRs as drafts (initial open only).
+        reviewers: GitHub handles to request review from.
+        dry_run: enumerate without firing pushes/opens.
+        base: override base branch for every repo.
+    """
+    from ..actions.ship import ship as ship_impl
+
+    ws = _get_workspace()
+    return ship_impl(
+        ws, feature=feature, repos=repos, draft=draft,
+        reviewers=reviewers, dry_run=dry_run, base=base,
+    )
+
+
+@mcp.tool()
+def draft_replies(alias: str, include_likely_resolved: bool = False) -> dict:
+    """Auto-draft "Done in <sha>" replies for addressed PR comments (M9).
+
+    For each unresolved comment, walk the file's git history since the
+    comment was anchored. If anything changed, the comment is
+    "addressed" — return a template-based draft the user reviews and
+    posts (or edits + posts). No LLM in v1.
+
+    Args:
+        alias: feature name, ``<repo>#<n>``, or PR URL.
+        include_likely_resolved: also draft for the temporal classifier's
+            ``likely_resolved`` set (weaker signal — surfaced as
+            ``confidence: low``).
+    """
+    from ..actions.draft_replies import draft_replies as draft_impl
+
+    ws = _get_workspace()
+    return draft_impl(ws, alias, include_likely_resolved=include_likely_resolved)
+
+
+@mcp.tool()
+def conflicts(
+    feature: str | None = None,
+    other: str | None = None,
+    include_cold: bool = False,
+    line_level: bool = False,
+) -> dict:
+    """Cross-feature file-overlap detection (M12).
+
+    Pairwise intersect each active feature's changed-file set per repo
+    and surface pairs that touch the same files. ``high`` severity
+    means same file (or, when ``line_level=True``, overlapping line
+    ranges) — the rebase will conflict; rebase one onto the other
+    before opening a PR.
+
+    Args:
+        feature: scope to "what overlaps with this feature." Returns
+            only pairs where ``feature`` is one side.
+        other: further scope to "specifically <feature> vs <other>."
+            Requires ``feature``.
+        include_cold: also consider cold features (no worktree). Default
+            keeps the focus on actively rotating features.
+        line_level: opt into the per-file line-range comparison. Slower
+            because it re-runs ``git diff --unified=0`` per repo, but
+            lets ``medium`` accurately mean "same file, disjoint lines."
+    """
+    from ..actions.conflicts import find_conflicts
+
+    ws = _get_workspace()
+    return find_conflicts(
+        ws, feature=feature, other=other,
+        include_cold=include_cold, line_level=line_level,
+    )
+
+
+@mcp.tool()
 def drift(feature: str | None = None) -> dict:
     """Compare recorded HEAD state vs feature lane expectations.
 

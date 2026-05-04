@@ -32,6 +32,11 @@ class RepoConfig:
     is_worktree: bool = False       # True if this is a linked worktree
     worktree_main: str | None = None  # path to main working tree (if worktree)
     augments: dict[str, Any] = field(default_factory=dict)  # per-repo augment overrides (M2)
+    # M6 worktree-bootstrap fields. All optional — missing means "skip
+    # this step." See docs/plans/worktree-bootstrap.md.
+    env_files: list[str] = field(default_factory=list)
+    install_cmd: str = ""
+    ide_settings: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -63,6 +68,9 @@ class WorkspaceConfig:
     max_worktrees: int = 0  # 0 = unlimited
     issue_provider: IssueProviderConfig = field(default_factory=IssueProviderConfig)
     augments: dict[str, Any] = field(default_factory=dict)  # workspace-level augment defaults (M2)
+    # M6 — IDE workspace template + per-workspace bootstrap default.
+    ide: str = "none"                   # "vscode" | "none" (default)
+    bootstrap_default: bool = False     # if true, --bootstrap is implicit on create/warm
 
 
 def load_config(path: Path | None = None) -> WorkspaceConfig:
@@ -132,6 +140,18 @@ def _parse_config(data: dict[str, Any], root: Path) -> WorkspaceConfig:
             raise ConfigError(
                 f"[[repos]] entry '{repo_name}' augments must be a table, got: {type(repo_augments).__name__}",
             )
+        env_files = entry.get("env_files") or []
+        if env_files and not (
+            isinstance(env_files, list) and all(isinstance(p, str) for p in env_files)
+        ):
+            raise ConfigError(
+                f"[[repos]] entry '{repo_name}' env_files must be a list of strings",
+            )
+        ide_settings = entry.get("ide_settings")
+        if ide_settings is not None and not isinstance(ide_settings, dict):
+            raise ConfigError(
+                f"[[repos]] entry '{repo_name}' ide_settings must be a table",
+            )
         repos.append(RepoConfig(
             name=repo_name,
             path=entry["path"],
@@ -139,9 +159,16 @@ def _parse_config(data: dict[str, Any], root: Path) -> WorkspaceConfig:
             lang=entry.get("lang", ""),
             default_branch=entry.get("default_branch", "main"),
             augments=dict(repo_augments) if repo_augments else {},
+            env_files=list(env_files),
+            install_cmd=entry.get("install_cmd", "") or "",
+            ide_settings=dict(ide_settings) if ide_settings else {},
         ))
 
     max_worktrees = workspace.get("max_worktrees", 0)
+    ide_choice = workspace.get("ide", "none")
+    if not isinstance(ide_choice, str):
+        raise ConfigError(f"[workspace] ide must be a string, got {type(ide_choice).__name__}")
+    bootstrap_default = bool(workspace.get("bootstrap_default", False))
     issue_provider = _parse_issue_provider(data)
     augments = _parse_augments(data)
 
@@ -152,6 +179,8 @@ def _parse_config(data: dict[str, Any], root: Path) -> WorkspaceConfig:
         max_worktrees=max_worktrees,
         issue_provider=issue_provider,
         augments=augments,
+        ide=ide_choice,
+        bootstrap_default=bootstrap_default,
     )
 
 

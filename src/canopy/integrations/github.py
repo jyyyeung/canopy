@@ -386,6 +386,224 @@ def list_open_prs(
     raise GitHubNotConfiguredError(payload=payload)
 
 
+def create_pr(
+    workspace_root: Path,
+    owner: str,
+    repo: str,
+    *,
+    branch: str,
+    base: str,
+    title: str,
+    body: str,
+    draft: bool = False,
+    reviewers: list[str] | None = None,
+) -> dict:
+    """Open a pull request. Returns ``{number, url, state}`` on success.
+
+    Tries the configured GitHub MCP server first, falls back to ``gh pr
+    create``. Raises ``GitHubNotConfiguredError`` if neither is available.
+    """
+    if is_mcp_configured(workspace_root, "github"):
+        config = _get_github_config(workspace_root)
+        args = {
+            "owner": owner, "repo": repo,
+            "head": branch, "base": base,
+            "title": title, "body": body, "draft": draft,
+        }
+        for tool_name in ("create_pull_request", "pull_request_create"):
+            try:
+                result = call_tool(config, tool_name, args, timeout=30.0, server_name="github")
+                parsed = _parse_mcp_result(result)
+                if parsed:
+                    pr = _normalize_pr(parsed)
+                    if reviewers:
+                        _request_reviewers_via_gh(owner, repo, pr["number"], reviewers)
+                    return pr
+            except McpClientError:
+                continue
+        # MCP configured but failed — fall through to gh below for resilience.
+
+    if have_gh_cli():
+        cli_args = [
+            "pr", "create",
+            "--repo", f"{owner}/{repo}",
+            "--head", branch, "--base", base,
+            "--title", title, "--body", body,
+        ]
+        if draft:
+            cli_args.append("--draft")
+        if reviewers:
+            cli_args += ["--reviewer", ",".join(reviewers)]
+        # gh pr create prints the PR URL on stdout (last non-empty line).
+        output = _gh(cli_args, timeout=30.0)
+        url = next((line for line in reversed(output.splitlines()) if line.strip()), "")
+        match = re.search(r"/pull/(\d+)", url)
+        pr_number = int(match.group(1)) if match else 0
+        if pr_number:
+            pr = get_pull_request_by_number(workspace_root, owner, repo, pr_number)
+            if pr:
+                return pr
+        return {"number": pr_number, "url": url.strip(), "state": "open"}
+
+    raise GitHubNotConfiguredError(payload=github_unavailable_blocker())
+
+
+def update_pr_body(
+    workspace_root: Path,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    body: str,
+) -> None:
+    """Update an existing PR's body. Raises if both backends fail."""
+    if is_mcp_configured(workspace_root, "github"):
+        config = _get_github_config(workspace_root)
+        for tool_name in ("update_pull_request", "pull_request_update"):
+            try:
+                call_tool(
+                    config, tool_name,
+                    {"owner": owner, "repo": repo,
+                     "pull_number": pr_number, "body": body},
+                    timeout=15.0, server_name="github",
+                )
+                return
+            except McpClientError:
+                continue
+
+    if have_gh_cli():
+        _gh([
+            "pr", "edit", str(pr_number),
+            "--repo", f"{owner}/{repo}",
+            "--body", body,
+        ], timeout=15.0)
+        return
+
+    raise GitHubNotConfiguredError(payload=github_unavailable_blocker())
+
+
+def _request_reviewers_via_gh(
+    owner: str, repo: str, pr_number: int, reviewers: list[str],
+) -> None:
+    """Best-effort reviewer request via gh; silent on failure since the PR
+    is already open by the time we get here."""
+    if not have_gh_cli() or not reviewers:
+        return
+    try:
+        _gh([
+            "pr", "edit", str(pr_number),
+            "--repo", f"{owner}/{repo}",
+            "--add-reviewer", ",".join(reviewers),
+        ], timeout=15.0)
+    except GitHubNotConfiguredError:
+        pass
+
+
+def get_pr_checks(
+    workspace_root: Path,
+    owner: str,
+    repo: str,
+    pr_number: int,
+) -> tuple[dict, list[dict]]:
+    """Fetch CI check runs for a PR (M10).
+
+    Returns ``(rolled_up_status, raw_check_list)``.
+
+    The roll-up shape mirrors the plan's spec::
+
+        {status: "passing"|"failing"|"pending"|"no_checks",
+         passed: int, failing: int, pending: int, skipped: int,
+         required_failing: [<name>...], required_pending: [<name>...],
+         details_url: str}
+
+    v1 sources from ``gh pr checks --json``. The MCP path is reserved for
+    when a github-mcp tool actually exposes check-run shape (the standard
+    server doesn't yet). Failure (gh missing, PR not found) returns the
+    sentinel ``{status: "no_checks"}`` rather than raising — CI is a
+    nice-to-have signal; we don't want it to brick ``feature_state``.
+    """
+    if not have_gh_cli():
+        return {"status": "no_checks"}, []
+    try:
+        output = _gh([
+            "pr", "checks", str(pr_number),
+            "--repo", f"{owner}/{repo}",
+            "--json", "name,state,bucket,description,workflow,link,startedAt,completedAt",
+        ], timeout=20.0)
+    except GitHubNotConfiguredError:
+        return {"status": "no_checks"}, []
+    try:
+        raw = json.loads(output) if output.strip() else []
+    except json.JSONDecodeError:
+        return {"status": "no_checks"}, []
+    if not isinstance(raw, list) or not raw:
+        return {"status": "no_checks"}, []
+
+    rollup = _rollup_checks(raw, owner=owner, repo=repo, pr_number=pr_number)
+    return rollup, raw
+
+
+def _rollup_checks(
+    raw: list[dict], *, owner: str, repo: str, pr_number: int,
+) -> dict:
+    """Reduce a list of check runs to the rolled-up status shape.
+
+    Bucket → state mapping (gh's ``bucket`` field is normalized):
+      pass    → counted as passed
+      fail    → counted as failing
+      pending → counted as pending
+      cancel  → counted as failing (a cancelled required check blocks)
+      skipping→ counted as skipped (informational)
+    """
+    passed = failing = pending = skipped = 0
+    failing_names: list[str] = []
+    pending_names: list[str] = []
+    for c in raw:
+        bucket = (c.get("bucket") or "").lower()
+        name = c.get("name") or ""
+        if bucket in ("pass", "success"):
+            passed += 1
+        elif bucket in ("fail", "failure", "cancel", "cancelled"):
+            failing += 1
+            if name:
+                failing_names.append(name)
+        elif bucket in ("pending", "queued", "running", "in_progress"):
+            pending += 1
+            if name:
+                pending_names.append(name)
+        elif bucket in ("skipping", "skipped", "neutral"):
+            skipped += 1
+        else:
+            # Unknown bucket — count as pending so we wait rather than
+            # claim passing.
+            pending += 1
+            if name:
+                pending_names.append(name)
+
+    if failing > 0:
+        status = "failing"
+    elif pending > 0:
+        status = "pending"
+    elif passed > 0:
+        status = "passing"
+    else:
+        status = "no_checks"
+
+    return {
+        "status": status,
+        "passed": passed,
+        "failing": failing,
+        "pending": pending,
+        "skipped": skipped,
+        # v1 doesn't query branch protection — every check is treated as
+        # "required" for state-machine purposes. Conservative: false
+        # negatives (informational red checks tagged as required) are
+        # less harmful than false positives (required check missed).
+        "required_failing": failing_names,
+        "required_pending": pending_names,
+        "details_url": f"https://github.com/{owner}/{repo}/pull/{pr_number}/checks",
+    }
+
+
 def _extract_prs(data: Any, branch: str) -> list[dict]:
     """Extract PR list from various MCP response shapes, filtering by branch."""
     if isinstance(data, list):
@@ -545,6 +763,9 @@ def _normalize_comments(data: Any) -> tuple[list[dict], int]:
             "created_at": c.get("created_at") or c.get("createdAt") or "",
             "url": c.get("html_url") or c.get("url") or "",
             "in_reply_to_id": c.get("in_reply_to_id"),
+            # M9: commit at which the comment was anchored — drives the
+            # "addressed since this sha" walk in draft_replies.
+            "commit_id": c.get("commit_id") or c.get("original_commit_id") or "",
         })
 
     return normalized, resolved_count
