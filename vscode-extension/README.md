@@ -4,6 +4,8 @@
 
 Canopy coordinates real Git branches and worktrees across multiple repositories — no proprietary abstractions, no virtual branches. This extension is a VSCode-native surface on top of the [Canopy CLI](https://github.com/ashmitb95/canopy); the same JSON contract the CLI ships. What the dashboard shows is exactly what `canopy state` / `canopy triage` / `canopy feature status` would show in a terminal.
 
+![Global dashboard](https://raw.githubusercontent.com/ashmitb95/canopy/main/vscode-extension/media/screenshots/dashboard-global.png)
+
 ---
 
 ## What it does
@@ -11,6 +13,8 @@ Canopy coordinates real Git branches and worktrees across multiple repositories 
 ### One panel, two modes — global and per-feature
 
 Global mode is the focus board. Three vertical lanes mirror Canopy's canonical-slot model: the **canonical** feature (what's currently in your main checkout), **warm** features (linked worktrees, instantly switchable), and **cold** features (branch-only, switching creates a worktree on demand). A right-hand triage rail surfaces the priority list across every PR — changes-requested, bot reviews, review-required, approved.
+
+![Feature dashboard](https://raw.githubusercontent.com/ashmitb95/canopy/main/vscode-extension/media/screenshots/dashboard-feature.png)
 
 Click any feature to drill in. The feature view stacks: linked Linear/GitHub issue body → per-repo cards with branch + target + dirty + PR + actionable threads + CI chips → temporally classified review threads grouped by repo (each with **Address in agent** / **Reply** / **Mark addressed** for bot threads) → unified-diff stack with click-to-open in VSCode's native diff viewer. The right rail is the action drawer: Priority list of actionable threads, Checks (preflight + cross-feature conflicts + worktree bootstrap), Commit & push (per-repo Stage / Commit / Push / Open PR + the **Ship feature** capstone + draft-replies generator), State (stash / pop / back to global), Open (IDE / issue / PRs).
 
