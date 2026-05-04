@@ -1,5 +1,11 @@
 # Change Log
 
+## 0.7.1
+
+- README points at the new dashboard screenshots via absolute
+  raw.githubusercontent.com URLs so the marketplace listing renders
+  them. Stale pre-rebuild screenshots removed.
+
 ## 0.7.0
 
 Pastel dashboard rebuild + the action surface for the new backend commands (`ship` / `draft-replies` / `conflicts` / `worktree-bootstrap` / `pr-checks`).
