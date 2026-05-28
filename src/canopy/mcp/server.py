@@ -1580,6 +1580,42 @@ def slots() -> dict:
     return state.to_dict() if state else {"canonical": None, "slots": {}}
 
 
+@mcp.tool()
+def migrate_slots() -> dict:
+    """One-shot migration from pre-3.0 canopy layout to the 3.0 slot model.
+
+    Renames .canopy/worktrees/<feature>/ → .canopy/worktrees/worktree-N/,
+    rewrites canopy.toml (max_worktrees → slots), and migrates
+    .canopy/state/active_feature.json → .canopy/state/slots.json.
+
+    Refuses to run if slots.json already exists (idempotency guard).
+    Returns: {moved: [...], slots: {slot_id: feature}, canonical, slot_count}.
+    """
+    import os
+    from pathlib import Path
+    from ..actions.migrate_slots import migrate, AlreadyMigratedError, NotLegacyError
+
+    # Find workspace root via CANOPY_ROOT or walk up from cwd.
+    env_root = os.environ.get("CANOPY_ROOT")
+    if env_root:
+        root = Path(env_root).resolve()
+    else:
+        root = Path.cwd().resolve()
+        while root != root.parent:
+            if (root / "canopy.toml").exists():
+                break
+            root = root.parent
+        else:
+            return {"error": "not in a canopy workspace"}
+
+    try:
+        return migrate(root)
+    except AlreadyMigratedError as e:
+        return {"error": "already_migrated", "detail": str(e)}
+    except NotLegacyError as e:
+        return {"error": "nothing_to_migrate", "detail": str(e)}
+
+
 # ── Entry point ──────────────────────────────────────────────────────────
 
 def main():

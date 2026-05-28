@@ -727,6 +727,15 @@ def worktree_remove(repo_path: Path, worktree_path: Path, force: bool = False) -
     return _run(args, cwd=repo_path)
 
 
+def worktree_move(main_repo: Path, old_path: Path, new_path: Path) -> None:
+    """Run `git worktree move <old_path> <new_path>` from main_repo.
+
+    Updates .git/worktrees/<name>/gitdir so the worktree's back-reference
+    to the main repo stays correct after the directory is relocated.
+    """
+    _run(["worktree", "move", str(old_path), str(new_path)], cwd=main_repo)
+
+
 # ── Log ───────────────────────────────────────────────────────────────────
 
 def commit_iso_date(repo_path: Path, ref: str = "HEAD") -> str:

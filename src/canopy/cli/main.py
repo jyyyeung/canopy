@@ -927,6 +927,44 @@ def cmd_slots(args: argparse.Namespace) -> None:
     console.print()
 
 
+def cmd_migrate_slots(args: argparse.Namespace) -> None:
+    """One-shot migration from pre-3.0 layout to 3.0 slot model."""
+    from ..actions.migrate_slots import migrate, AlreadyMigratedError, NotLegacyError
+    from .ui import console
+
+    # Don't use _load_workspace() — pre-3.0 canopy.toml fails load_config validation.
+    # Walk up from cwd looking for canopy.toml directly.
+    root = Path.cwd().resolve()
+    while root != root.parent:
+        if (root / "canopy.toml").exists():
+            break
+        root = root.parent
+    else:
+        print("Error: not inside a canopy workspace (no canopy.toml found)", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        result = migrate(root)
+    except AlreadyMigratedError as e:
+        print(f"Error: already migrated: {e}", file=sys.stderr)
+        sys.exit(1)
+    except NotLegacyError as e:
+        console.print(f"  [muted]Nothing to migrate: {e}[/]")
+        return
+
+    if args.json:
+        _print_json(result)
+        return
+
+    console.print()
+    console.print(f"  [success]Migrated {len(result['moved'])} worktree dir(s) to slots[/]")
+    for sid, feat in result["slots"].items():
+        console.print(f"    {sid}: [info]{feat}[/]")
+    if result["canonical"]:
+        console.print(f"  [header]Canonical:[/] [info]{result['canonical']}[/]")
+    console.print()
+
+
 def _open_ide(ide_cmd: str, args: argparse.Namespace) -> None:
     """Open an IDE with the right directories for a feature or workspace.
 
@@ -3357,6 +3395,13 @@ def main() -> None:
     )
     slots_p.add_argument("--json", action="store_true", help="Output as JSON")
 
+    # migrate-slots
+    migrate_slots_p = subparsers.add_parser(
+        "migrate-slots",
+        help="One-shot migration from pre-3.0 feature-named worktrees to the 3.0 slot model",
+    )
+    migrate_slots_p.add_argument("--json", action="store_true", help="Output as JSON")
+
     # setup-agent
     setup_p = subparsers.add_parser(
         "setup-agent",
@@ -3594,6 +3639,7 @@ def main() -> None:
         "comments": cmd_comments,
         "switch": cmd_switch,
         "slots": cmd_slots,
+        "migrate-slots": cmd_migrate_slots,
         "commit": cmd_commit,
         "bot-status": cmd_bot_status,
         "historian": cmd_historian,
