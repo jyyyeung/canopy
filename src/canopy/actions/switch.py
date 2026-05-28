@@ -36,11 +36,13 @@ from .errors import BlockerError, FixAction
 
 def switch(
     workspace: Workspace,
-    feature: str,
+    feature: str | None = None,
     *,
     release_current: bool = False,
     no_evict: bool = False,
     evict: str | None = None,
+    evict_to: str | None = None,
+    to_slot: str | None = None,
 ) -> dict[str, Any]:
     """Promote ``feature`` to the canonical slot.
 
@@ -55,10 +57,36 @@ def switch(
         evict: explicit feature name to evict from warm to cold instead of
             the LRU pick. Used when the user wants control after a
             cap-reached blocker surfaced an LRU candidate.
+        evict_to: pin which slot the previously-canonical feature evacuates
+            to (overrides the LRU-coldest-free pick).
+        to_slot: promote the feature currently in this slot to canonical.
+            Sugar over ``switch(<feature-in-slot>)``.
 
     Returns ``{feature, mode, per_repo_paths, previously_canonical?,
     evacuation?, eviction?, branches_created?, migration?}``.
     """
+    # to_slot: resolve the occupant and forward
+    if to_slot is not None:
+        if feature is not None:
+            raise BlockerError(
+                code="ambiguous_switch_args",
+                what="pass `feature` OR `--to-slot`, not both",
+            )
+        occupant = slots_mod.feature_for_slot(workspace, to_slot)
+        if occupant is None:
+            raise BlockerError(
+                code="slot_empty",
+                what=f"slot '{to_slot}' is empty — nothing to promote",
+                details={"slot": to_slot},
+            )
+        feature = occupant
+
+    if feature is None:
+        raise BlockerError(
+            code="missing_feature",
+            what="switch needs a feature name or --to-slot",
+        )
+
     _ensure_post_migration(workspace)
     _ensure_consistent(workspace)
     feature_name = resolve_feature_safely(workspace, feature)
@@ -117,6 +145,7 @@ def switch(
                 previously_canonical=previously_canonical,
                 per_repo_results=per_repo_results,
                 new_canonical_paths=new_canonical_paths,
+                evict_to=evict_to,
             )
         except BlockerError as e:
             # Even a structured precondition failure (e.g. dirty warm
@@ -170,6 +199,7 @@ def _do_repo_switch(
     previously_canonical: str | None,
     per_repo_results: list[dict[str, Any]],
     new_canonical_paths: dict[str, str],
+    evict_to: str | None = None,
 ) -> None:
     """Per-repo switch body — extracted so the caller can wrap it in a
     structured mid-op error handler. Mutates the lists/dicts in place."""
@@ -247,7 +277,25 @@ def _do_repo_switch(
         state = slots_mod.read_state(workspace) or slots_mod.SlotState(
             slot_count=workspace.config.slots,
         )
-        x_slot = slots_mod.allocate_slot(state)
+        if evict_to is not None:
+            # Validate the slot id is in range
+            valid_slots = {f"worktree-{i}" for i in range(1, workspace.config.slots + 1)}
+            if evict_to not in valid_slots:
+                raise BlockerError(
+                    code="unknown_slot",
+                    what=f"--evict-to {evict_to} is out of range (cap={workspace.config.slots})",
+                )
+            if evict_to in state.slots:
+                existing = state.slots[evict_to].feature
+                if existing != feature_name:
+                    raise BlockerError(
+                        code="evict_to_occupied",
+                        what=f"slot '{evict_to}' is already occupied by '{existing}'",
+                        details={"slot": evict_to, "occupant": existing},
+                    )
+            x_slot = evict_to
+        else:
+            x_slot = slots_mod.allocate_slot(state)
         if x_slot is None:
             # Preflight should have caught this; defensive
             raise BlockerError(

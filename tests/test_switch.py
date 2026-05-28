@@ -114,6 +114,37 @@ def test_partial_switch_failure_marks_in_flight(
     assert "simulated git failure" in state.in_flight["error_what"]
 
 
+def test_switch_evict_to_pins_destination_slot(workspace_with_canonical_only):
+    """switch(Y, evict_to='worktree-2') → X lands in slot-2 (not LRU pick)."""
+    ws = workspace_with_canonical_only
+    from canopy.actions.switch import switch
+    from canopy.actions import slots as sm
+
+    result = switch(ws, "Y", evict_to="worktree-2")
+
+    state = sm.read_state(ws)
+    assert state is not None
+    assert state.canonical is not None
+    assert state.canonical.feature == "Y"
+    assert state.slots["worktree-2"].feature == "X"
+    assert "worktree-1" not in state.slots
+
+
+def test_switch_to_slot_promotes_occupant(workspace_with_slots):
+    """slot-1 has Y; switch(to_slot='worktree-1') → Y becomes canonical."""
+    ws = workspace_with_slots
+    from canopy.actions.switch import switch
+    from canopy.actions import slots as sm
+
+    result = switch(ws, feature=None, to_slot="worktree-1")
+
+    assert result["feature"] == "Y"
+    state = sm.read_state(ws)
+    assert state is not None
+    assert state.canonical is not None
+    assert state.canonical.feature == "Y"
+
+
 def test_switch_blocked_when_in_flight_set(workspace_with_canonical_only):
     """Pre-seeded in_flight marker → switch refuses with slot_state_inconsistent."""
     ws = workspace_with_canonical_only

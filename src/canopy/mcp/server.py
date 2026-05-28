@@ -198,8 +198,9 @@ def triage(author: str = "@me", repos: list[str] | None = None) -> dict:
 
 
 @mcp.tool()
-def switch(feature: str, release_current: bool = False,
-           no_evict: bool = False, evict: str | None = None) -> dict:
+def switch(feature: str | None = None, release_current: bool = False,
+           no_evict: bool = False, evict: str | None = None,
+           evict_to: str | None = None, to_slot: str | None = None) -> dict:
     """Promote a feature to the canonical slot (Wave 3.0 canonical-slot model).
 
     Worktrees live in numbered slots (``.canopy/worktrees/worktree-N/``),
@@ -248,6 +249,8 @@ def switch(feature: str, release_current: bool = False,
             release_current=release_current,
             no_evict=no_evict,
             evict=evict,
+            evict_to=evict_to,
+            to_slot=to_slot,
         )
     except ActionError as e:
         # Surface BlockerError / FailedError as a structured response so

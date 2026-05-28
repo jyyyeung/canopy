@@ -2318,13 +2318,17 @@ def cmd_switch(args: argparse.Namespace) -> None:
     from .ui import console, spinner
 
     workspace = _load_workspace()
+    to_slot = getattr(args, "to_slot", None)
+    label = to_slot or args.feature or "feature"
     try:
-        with spinner(f"Switching to {args.feature}…"):
+        with spinner(f"Switching to {label}…"):
             result = switch_impl(
                 workspace, args.feature,
                 release_current=getattr(args, "release_current", False),
                 no_evict=getattr(args, "no_evict", False),
                 evict=getattr(args, "evict", None),
+                evict_to=getattr(args, "evict_to", None),
+                to_slot=to_slot,
             )
     except ActionError as err:
         if args.json:
@@ -3433,13 +3437,18 @@ def main() -> None:
         "switch",
         help="Promote a feature to the canonical slot (canonical-slot model)",
     )
-    switch_p.add_argument("feature", help="Feature alias (name or Linear ID)")
+    switch_p.add_argument("feature", nargs="?", default=None,
+                           help="Feature alias (name or Linear ID)")
     switch_p.add_argument("--release-current", action="store_true",
                            help="Wind-down mode: previous canonical goes cold (no warm worktree)")
     switch_p.add_argument("--no-evict", action="store_true",
                            help="Refuse to auto-evict an LRU warm worktree if cap would fire")
     switch_p.add_argument("--evict", default=None,
                            help="Explicit feature name to evict to cold (overrides LRU pick)")
+    switch_p.add_argument("--evict-to", default=None,
+                           help="Pin which slot the previous canonical evacuates to")
+    switch_p.add_argument("--to-slot", default=None,
+                           help="Promote the feature currently in this slot to canonical")
     switch_p.add_argument("--json", action="store_true", help="Output as JSON")
 
     # slots
