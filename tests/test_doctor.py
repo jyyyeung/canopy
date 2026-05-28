@@ -861,11 +861,36 @@ def test_doctor_finds_slot_branch_mismatch(workspace_with_slots):
     """A slot's worktree is on a different branch than slots.json records → mismatch."""
     import subprocess
     root = workspace_with_slots.config.root
-    # Detach HEAD so current_branch returns something other than the recorded feature branch
+    # Check out an unrelated existing branch (NOT detached) so the check
+    # fires a real branch mismatch rather than the detached-HEAD path.
+    repo_a = root / "repo-a"
+    subprocess.run(["git", "branch", "OTHER"], cwd=repo_a, check=True)
     subprocess.run(
-        ["git", "checkout", "--detach"],
+        ["git", "checkout", "OTHER"],
         cwd=root / ".canopy/worktrees/worktree-1/repo-a", check=True,
     )
     result = doctor(workspace_with_slots)
     findings = [f for f in result["issues"] if f["code"] == "slot_branch_mismatch"]
     assert any("worktree-1" in f.get("what", "") for f in findings)
+
+
+def test_doctor_flags_detached_head_separately(workspace_with_slots):
+    """Detached HEAD inside a slot's worktree fires slot_detached_head
+    (info severity) and does NOT double-fire as slot_branch_mismatch."""
+    import subprocess
+    root = workspace_with_slots.config.root
+    subprocess.run(
+        ["git", "checkout", "--detach"],
+        cwd=root / ".canopy/worktrees/worktree-1/repo-a", check=True,
+    )
+    result = doctor(workspace_with_slots)
+    findings = [f for f in result["issues"] if f["code"] == "slot_detached_head"]
+    assert findings, "expected slot_detached_head finding"
+    # Should NOT also produce slot_branch_mismatch for the same slot/repo
+    mismatches = [
+        f for f in result["issues"]
+        if f["code"] == "slot_branch_mismatch"
+        and f.get("details", {}).get("slot") == "worktree-1"
+        and f.get("details", {}).get("repo") == "repo-a"
+    ]
+    assert not mismatches, "detached HEAD should not double-fire as mismatch"

@@ -46,6 +46,7 @@ def preflight(
     *,
     release_current: bool = False,
     no_evict: bool = False,
+    evict_to: str | None = None,
 ) -> dict[str, Any]:
     """Pre-validate a ``switch`` call. Raises ``BlockerError`` on failure.
 
@@ -56,6 +57,9 @@ def preflight(
             is skipped (X goes cold, no warm slot consumed).
         no_evict: in active-rotation mode, refuse to evict an LRU warm
             worktree when the cap is full instead of asking the user.
+        evict_to: if set, the user has pinned a destination slot for X.
+            Skip the cap-fire check — the explicit-slot path (in switch)
+            handles validation + eviction of any occupant.
 
     Returns a small fact dict the caller can use to make decisions:
     ``{branches_to_create: [(repo, branch)], cap_will_fire: bool,
@@ -104,10 +108,13 @@ def preflight(
         {e.feature for e in state.slots.values()} if state else set()
     )
 
-    # Cap-will-fire check (only active-rotation mode evacuates X to warm)
+    # Cap-will-fire check (only active-rotation mode evacuates X to warm).
+    # When the user pinned a destination via ``--evict-to``, the
+    # explicit-slot path in switch handles validation + occupant
+    # eviction, so skip the cap-fire surface here.
     cap_will_fire = False
     lru_eviction_candidate: str | None = None
-    if previously_canonical and not release_current:
+    if previously_canonical and not release_current and evict_to is None:
         cap = warm_slot_cap(workspace)
         # Y is becoming canonical, so if Y was warm it leaves the warm set;
         # X (previously_canonical) is joining the warm set.

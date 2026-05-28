@@ -94,3 +94,35 @@ def test_migrate_refuses_if_slots_json_exists(workspace_v2_layout):
     from canopy.actions.migrate_slots import migrate, AlreadyMigratedError
     with pytest.raises(AlreadyMigratedError):
         migrate(workspace_v2_layout)
+
+
+def test_migrate_aborts_cleanly_on_move_failure(workspace_v2_layout, monkeypatch):
+    """If git worktree move fails mid-migration, no state is left half-written.
+
+    Uses Option B (rollback): the partial-failure path attempts to undo
+    completed moves so the user lands back on the pre-3.0 layout.
+    """
+    from canopy.actions.migrate_slots import migrate
+    from canopy.actions.errors import BlockerError
+    from canopy.git import repo as git_mod
+
+    real_move = git_mod.worktree_move
+    call_count = {"n": 0}
+
+    def flaky_move(main, old, new):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise RuntimeError("simulated move failure")
+        return real_move(main, old, new)
+
+    monkeypatch.setattr(git_mod, "worktree_move", flaky_move)
+    with pytest.raises(BlockerError):
+        migrate(workspace_v2_layout)
+    # No slots.json was written (idempotency guard works on re-run)
+    assert not (workspace_v2_layout / ".canopy/state/slots.json").exists()
+    # The user can recover — auth-flow worktree still exists somewhere
+    # under .canopy/worktrees (either back at its old feature path after
+    # rollback, or at the new slot path if that one move succeeded).
+    feature_dir = workspace_v2_layout / ".canopy/worktrees/auth-flow"
+    slot_dir = workspace_v2_layout / ".canopy/worktrees/worktree-1"
+    assert feature_dir.exists() or slot_dir.exists()

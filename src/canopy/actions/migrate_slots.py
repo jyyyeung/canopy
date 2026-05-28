@@ -28,6 +28,7 @@ else:
 
 from ..git import repo as git
 from . import slots as slots_mod
+from .errors import BlockerError
 
 
 class AlreadyMigratedError(Exception):
@@ -104,19 +105,134 @@ def migrate(workspace_root: Path) -> dict[str, Any]:
     for i, feature in enumerate(sorted(legacy.keys()), start=1):
         slot_assignment[feature] = f"worktree-{i}"
 
-    # 3. Move each repo dir via `git worktree move`
-    moved: list[dict[str, str]] = []
+    # 3a. Dry-run preflight: validate every move target BEFORE touching disk.
+    # Avoids the half-migrated state that wedges the user (some dirs at the
+    # new slot path, others at the old feature path, no slots.json yet).
+    preflight_issues: list[dict[str, Any]] = []
     for feature, repos in legacy.items():
         slot_id = slot_assignment[feature]
-        (wt_base / slot_id).mkdir(parents=True, exist_ok=True)
         for repo_name in repos:
             old_path = wt_base / feature / repo_name
             new_path = wt_base / slot_id / repo_name
             main_repo = repo_paths_by_name.get(repo_name)
             if main_repo is None or not main_repo.exists():
+                preflight_issues.append({
+                    "kind": "main_repo_missing", "repo": repo_name,
+                    "feature": feature, "main_repo": str(main_repo) if main_repo else None,
+                })
                 continue
-            git.worktree_move(main_repo, old_path, new_path)
-            moved.append({"from": str(old_path), "to": str(new_path)})
+            if not old_path.exists():
+                preflight_issues.append({
+                    "kind": "source_missing", "repo": repo_name,
+                    "feature": feature, "path": str(old_path),
+                })
+                continue
+            if not (old_path / ".git").exists():
+                preflight_issues.append({
+                    "kind": "source_not_a_worktree", "repo": repo_name,
+                    "feature": feature, "path": str(old_path),
+                })
+                continue
+            if new_path.exists():
+                preflight_issues.append({
+                    "kind": "destination_exists", "repo": repo_name,
+                    "feature": feature, "path": str(new_path),
+                })
+                continue
+            # Validate the worktree is registered with git (catches locked worktrees).
+            try:
+                listed = git.worktree_list(main_repo)
+                listed_paths = {Path(w.get("path", "")).resolve() for w in listed}
+                if old_path.resolve() not in listed_paths:
+                    preflight_issues.append({
+                        "kind": "worktree_unregistered", "repo": repo_name,
+                        "feature": feature, "path": str(old_path),
+                    })
+            except Exception as e:  # noqa: BLE001 — surface as a single issue
+                preflight_issues.append({
+                    "kind": "worktree_list_failed", "repo": repo_name,
+                    "feature": feature, "error": str(e),
+                })
+
+    if preflight_issues:
+        raise BlockerError(
+            code="migration_preflight_failed",
+            what=(
+                f"{len(preflight_issues)} issue(s) detected before migration could begin — "
+                f"refusing to start so the workspace stays in the pre-3.0 layout"
+            ),
+            details={"issues": preflight_issues},
+        )
+
+    # 3b. Move each repo dir via `git worktree move`. If any move fails
+    # mid-loop, attempt to undo the completed ones so the user lands back
+    # on the pre-3.0 layout rather than a half-migrated wedge.
+    moved: list[dict[str, str]] = []
+    try:
+        for feature, repos in legacy.items():
+            slot_id = slot_assignment[feature]
+            (wt_base / slot_id).mkdir(parents=True, exist_ok=True)
+            for repo_name in repos:
+                old_path = wt_base / feature / repo_name
+                new_path = wt_base / slot_id / repo_name
+                main_repo = repo_paths_by_name.get(repo_name)
+                if main_repo is None or not main_repo.exists():
+                    continue
+                git.worktree_move(main_repo, old_path, new_path)
+                moved.append({"from": str(old_path), "to": str(new_path)})
+    except Exception as move_err:  # noqa: BLE001
+        # Best-effort rollback: move each completed entry back to its old path.
+        unrolled: list[dict[str, str]] = []
+        rollback_failures: list[dict[str, str]] = []
+        for m in reversed(moved):
+            new_path = Path(m["to"])
+            old_path = Path(m["from"])
+            # Figure out which repo this was so we can address the main repo.
+            repo_name = new_path.name
+            main_repo = repo_paths_by_name.get(repo_name)
+            if main_repo is None:
+                rollback_failures.append({**m, "error": "no main repo"})
+                continue
+            try:
+                old_path.parent.mkdir(parents=True, exist_ok=True)
+                git.worktree_move(main_repo, new_path, old_path)
+                unrolled.append({"from": str(new_path), "to": str(old_path)})
+            except Exception as e:  # noqa: BLE001
+                rollback_failures.append({**m, "error": str(e)})
+        # Best-effort cleanup of empty slot dirs we created during the failed pass.
+        for feature in legacy:
+            slot_id = slot_assignment[feature]
+            slot_dir = wt_base / slot_id
+            try:
+                if slot_dir.exists() and not any(slot_dir.iterdir()):
+                    slot_dir.rmdir()
+            except OSError:
+                pass
+        if rollback_failures:
+            raise BlockerError(
+                code="migration_partial",
+                what=(
+                    "migration failed mid-loop AND rollback could not return"
+                    " every dir to its pre-3.0 location — manual cleanup required"
+                ),
+                details={
+                    "underlying_error": str(move_err),
+                    "moved_dirs": moved,
+                    "unrolled_dirs": unrolled,
+                    "rollback_failures": rollback_failures,
+                },
+            )
+        raise BlockerError(
+            code="migration_aborted",
+            what=(
+                "migration failed mid-loop; reverted to pre-3.0 layout — "
+                "re-run after resolving the underlying error"
+            ),
+            details={
+                "underlying_error": str(move_err),
+                "rolled_back_dirs": unrolled,
+            },
+        )
 
     # 4. Rewrite canopy.toml: max_worktrees → slots
     text = toml_path.read_text()

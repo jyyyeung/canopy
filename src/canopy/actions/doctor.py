@@ -529,7 +529,12 @@ def check_slot_entry_orphans(workspace: Workspace) -> list[Issue]:
 
 
 def check_slot_branch_mismatches(workspace: Workspace) -> list[Issue]:
-    """Find slots where the worktree HEAD doesn't match the feature's expected branch."""
+    """Find slots where the worktree HEAD doesn't match the feature's expected branch.
+
+    Detached HEAD is reported as a separate ``slot_detached_head`` finding
+    (info severity) — it's a recoverable user-driven state, not a real
+    branch mismatch.
+    """
     from . import slots as slots_mod
     from .aliases import repos_for_feature
 
@@ -547,28 +552,55 @@ def check_slot_branch_mismatches(workspace: Workspace) -> list[Issue]:
                 actual_branch = git.current_branch(slot_path)
             except Exception:
                 continue
-            if actual_branch != expected_branch:
+            if actual_branch == expected_branch:
+                continue
+            if actual_branch == "(detached)":
+                # Detached HEAD is a separate, lighter finding — the user
+                # explicitly detached (e.g., `git checkout <sha>`) and the
+                # slot can be re-attached with a single `git checkout`.
                 issues.append(Issue(
-                    code="slot_branch_mismatch",
-                    severity="warn",
+                    code="slot_detached_head",
+                    severity="info",
                     what=(
-                        f"slot '{sid}' repo '{repo_name}' is on '{actual_branch}'"
-                        f" but feature '{entry.feature}' expects '{expected_branch}'"
+                        f"slot '{sid}' repo '{repo_name}' has detached HEAD"
+                        f" (feature '{entry.feature}' expects '{expected_branch}')"
                     ),
                     expected=expected_branch,
-                    actual=actual_branch,
+                    actual="(detached)",
                     repo=repo_name,
                     feature=entry.feature,
                     fix_action=(
-                        f"git checkout {expected_branch} in {sid}/{repo_name};"
-                        f" or re-record via canopy slot load --replace"
+                        f"git checkout {expected_branch} in {sid}/{repo_name}"
+                        f" to re-attach"
                     ),
                     auto_fixable=False,
                     details={
                         "slot": sid, "feature": entry.feature, "repo": repo_name,
-                        "expected_branch": expected_branch, "actual_branch": actual_branch,
+                        "expected_branch": expected_branch,
                     },
                 ))
+                continue
+            issues.append(Issue(
+                code="slot_branch_mismatch",
+                severity="warn",
+                what=(
+                    f"slot '{sid}' repo '{repo_name}' is on '{actual_branch}'"
+                    f" but feature '{entry.feature}' expects '{expected_branch}'"
+                ),
+                expected=expected_branch,
+                actual=actual_branch,
+                repo=repo_name,
+                feature=entry.feature,
+                fix_action=(
+                    f"git checkout {expected_branch} in {sid}/{repo_name};"
+                    f" or re-record via canopy slot load --replace"
+                ),
+                auto_fixable=False,
+                details={
+                    "slot": sid, "feature": entry.feature, "repo": repo_name,
+                    "expected_branch": expected_branch, "actual_branch": actual_branch,
+                },
+            ))
     return issues
 
 
@@ -864,6 +896,11 @@ _CHECKS: dict[str, tuple[str, Any]] = {
     "slot_dir_orphan": ("slots", check_slot_dir_orphans),
     "slot_entry_orphan": ("slots", check_slot_entry_orphans),
     "slot_branch_mismatch": ("slots", check_slot_branch_mismatches),
+    # slot_detached_head shares its check function with slot_branch_mismatch
+    # (one walker emits both codes). The registry entry uses a sentinel
+    # check that returns [] so the orchestrator doesn't double-emit; the
+    # fix-loop lookup still finds the category for category filtering.
+    "slot_detached_head": ("slots", lambda _ws: []),
 }
 
 

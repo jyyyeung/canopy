@@ -130,6 +130,26 @@ def test_switch_evict_to_pins_destination_slot(workspace_with_canonical_only):
     assert "worktree-1" not in state.slots
 
 
+def test_switch_evict_to_occupied_slot_evicts_and_replaces(workspace_with_full_slots):
+    """With all slots full, switch(NEW, evict_to=<slot-1>) evicts slot-1's
+    occupant and pins X (the previously-canonical feature) there — no
+    cap-reached blocker fires when the destination is pinned."""
+    import subprocess
+    ws = workspace_with_full_slots
+    # Create NEW branch in both repos
+    for repo in ("repo-a", "repo-b"):
+        subprocess.run(["git", "branch", "NEW"], cwd=ws.config.root / repo, check=True)
+    from canopy.actions.switch import switch
+    from canopy.actions import slots as sm
+    result = switch(ws, "NEW", evict_to="worktree-1")
+    assert result["feature"] == "NEW"
+    state = sm.read_state(ws)
+    assert state.canonical is not None
+    assert state.canonical.feature == "NEW"
+    # X (previously canonical) landed in the pinned slot
+    assert state.slots["worktree-1"].feature == "X"
+
+
 def test_switch_to_slot_promotes_occupant(workspace_with_slots):
     """slot-1 has Y; switch(to_slot='worktree-1') → Y becomes canonical."""
     ws = workspace_with_slots

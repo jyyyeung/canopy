@@ -15,6 +15,39 @@ from .errors import BlockerError, FixAction
 from . import slots as slots_mod
 
 
+def _ensure_consistent_slot_state(workspace: Workspace) -> None:
+    """Refuse slot operations when a prior op left an in_flight marker.
+
+    Mirrors switch._ensure_consistent — a prior slot op partially failed
+    and the workspace is in a half-flipped state. Continuing would
+    compound the inconsistency. Surface a structured blocker and let the
+    user run `canopy doctor` to inspect.
+    """
+    state = slots_mod.read_state(workspace)
+    if state is None or state.in_flight is None:
+        return
+    inf = state.in_flight
+    raise BlockerError(
+        code="slot_state_inconsistent",
+        what=(
+            f"a prior {inf.get('operation', 'slot op')} failed in "
+            f"repo '{inf.get('failed_repo')}' — workspace is partially flipped"
+        ),
+        details={"in_flight": dict(inf)},
+        fix_actions=[
+            FixAction(
+                action="doctor",
+                args={},
+                safe=True,
+                preview=(
+                    "run `canopy doctor` to inspect slots.json and the "
+                    "in_flight marker; resolve manually, then clear it"
+                ),
+            ),
+        ],
+    )
+
+
 def slot_load(
     workspace: Workspace,
     feature: str,
@@ -32,6 +65,7 @@ def slot_load(
       - unknown_slot: slot_id is out of range
       - worktree_cap_reached: all slots full and slot_id was not given
     """
+    _ensure_consistent_slot_state(workspace)
     feature_name = resolve_feature(workspace, feature)
     state = slots_mod.read_state(workspace) or slots_mod.SlotState(
         slot_count=workspace.config.slots,
@@ -112,9 +146,19 @@ def slot_load(
     )
 
     # Add worktrees per repo — iterate repos_for_feature (respects partial scope).
-    repo_branches = repos_for_feature(workspace, feature_name) or {
-        r.config.name: feature_name for r in workspace.repos
-    }
+    # Refuse to auto-allocate "all repos" for unregistered features — that
+    # silently over-scopes partial-scope work. Force the user to declare
+    # intent via `canopy feature create <name> --repos <list>` first.
+    repo_branches = repos_for_feature(workspace, feature_name)
+    if not repo_branches:
+        raise BlockerError(
+            code="ambiguous_feature_scope",
+            what=(
+                f"feature '{feature_name}' is not yet registered — "
+                f"run `canopy feature create <name> --repos <list>` first"
+            ),
+            details={"feature": feature_name},
+        )
     per_repo: list[dict] = []
     for repo_name, branch in repo_branches.items():
         try:
@@ -166,6 +210,7 @@ def slot_clear(workspace: Workspace, slot_id: str) -> dict[str, Any]:
     worktree (best-effort — stash failure does not block removal). The branch
     is kept; only the warm worktree is removed.
     """
+    _ensure_consistent_slot_state(workspace)
     state = slots_mod.read_state(workspace)
     if state is None or slot_id not in state.slots:
         raise BlockerError(
@@ -187,12 +232,30 @@ def slot_clear(workspace: Workspace, slot_id: str) -> dict[str, Any]:
             cleared.append({"repo": repo_name, "status": "missing", "slot_path": str(slot_path)})
             continue
         # Tag any dirty work with a feature-tagged stash before removing the worktree.
+        # Critical: if the slot is dirty AND stash fails, refuse to remove the
+        # worktree — silent data loss is never acceptable.
         stash_ref = None
+        stash_failed = False
         try:
             from . import evacuate as evac
             stash_ref = evac.stash_for_evacuation(workspace, feature, repo_name, slot_path)
         except Exception:
-            stash_ref = None  # best-effort; proceed with remove
+            stash_failed = True
+        if stash_failed:
+            try:
+                dirty = git.is_dirty(slot_path)
+            except Exception:
+                dirty = True  # conservative: assume dirty when we can't tell
+            if dirty:
+                raise BlockerError(
+                    code="evict_stash_failed",
+                    what=(
+                        f"slot '{slot_id}' repo '{repo_name}' is dirty but stash failed; "
+                        f"refusing to remove worktree"
+                    ),
+                    details={"slot": slot_id, "repo": repo_name,
+                             "slot_path": str(slot_path)},
+                )
         try:
             git.worktree_remove(repo.abs_path, slot_path, force=True)
         except Exception as e:
@@ -217,7 +280,12 @@ def slot_swap(workspace: Workspace, slot_a: str, slot_b: str) -> dict[str, Any]:
     Performs two parallel branch checkouts inside the slot worktrees and
     updates slots.json — no worktree_add or worktree_remove involved.
     Raises swap_scope_mismatch when the two features touch different repo sets.
+
+    On a phase-2 checkout failure, attempts to re-checkout each slot's
+    original branch (best-effort rollback) and persists an ``in_flight``
+    marker so the next slot op refuses to operate on a half-swapped state.
     """
+    _ensure_consistent_slot_state(workspace)
     state = slots_mod.read_state(workspace)
     if state is None:
         raise BlockerError(code="no_slot_state", what="no slots.json")
@@ -251,20 +319,52 @@ def slot_swap(workspace: Workspace, slot_a: str, slot_b: str) -> dict[str, Any]:
     # so we detach both slots first to free the branch locks, then do the checkouts.
     per_repo: list[dict] = []
     repo_names = sorted(branches_a.keys())
+    # Phase 1: detach every slot's repo HEAD so the branches are free.
     for repo_name in repo_names:
         slot_a_path = slots_mod.slot_worktree_path(workspace, slot_a, repo_name)
         slot_b_path = slots_mod.slot_worktree_path(workspace, slot_b, repo_name)
         git.checkout_detach(slot_a_path)
         git.checkout_detach(slot_b_path)
-    for repo_name in repo_names:
-        slot_a_path = slots_mod.slot_worktree_path(workspace, slot_a, repo_name)
-        slot_b_path = slots_mod.slot_worktree_path(workspace, slot_b, repo_name)
-        # slot A's worktree adopts feat_b's branch; slot B's worktree adopts feat_a's branch.
-        git.checkout(slot_a_path, branches_b[repo_name])
-        git.checkout(slot_b_path, branches_a[repo_name])
-        per_repo.append({"repo": repo_name,
-                          "slot_a_now": branches_b[repo_name],
-                          "slot_b_now": branches_a[repo_name]})
+
+    # Phase 2: adopt the swapped branches. On failure, attempt to re-checkout
+    # each slot's ORIGINAL branch (rollback) and persist an in_flight marker
+    # so the next slot op refuses to run on a half-flipped state.
+    try:
+        for repo_name in repo_names:
+            slot_a_path = slots_mod.slot_worktree_path(workspace, slot_a, repo_name)
+            slot_b_path = slots_mod.slot_worktree_path(workspace, slot_b, repo_name)
+            # slot A's worktree adopts feat_b's branch; slot B's worktree adopts feat_a's branch.
+            git.checkout(slot_a_path, branches_b[repo_name])
+            git.checkout(slot_b_path, branches_a[repo_name])
+            per_repo.append({"repo": repo_name,
+                              "slot_a_now": branches_b[repo_name],
+                              "slot_b_now": branches_a[repo_name]})
+    except Exception as e:
+        failed_repo = repo_name  # last iterated value
+        # Best-effort rollback: put every slot back on its ORIGINAL branch.
+        for rn in repo_names:
+            slot_a_path = slots_mod.slot_worktree_path(workspace, slot_a, rn)
+            slot_b_path = slots_mod.slot_worktree_path(workspace, slot_b, rn)
+            try:
+                git.checkout(slot_a_path, branches_a[rn])
+            except Exception:
+                pass
+            try:
+                git.checkout(slot_b_path, branches_b[rn])
+            except Exception:
+                pass
+        # Persist in_flight marker — slots.json otherwise unchanged.
+        cur = slots_mod.read_state(workspace) or state
+        cur.in_flight = {
+            "operation": "slot_swap",
+            "slot_a": slot_a, "slot_b": slot_b,
+            "feat_a": feat_a, "feat_b": feat_b,
+            "started_at": slots_mod.now_iso(),
+            "failed_repo": failed_repo,
+            "error_what": str(e),
+        }
+        slots_mod.write_state(workspace, cur)
+        raise
 
     now = slots_mod.now_iso()
     state = slots_mod.read_state(workspace) or state
@@ -272,6 +372,8 @@ def slot_swap(workspace: Workspace, slot_a: str, slot_b: str) -> dict[str, Any]:
     state.slots[slot_b] = slots_mod.SlotEntry(feature=feat_a, occupied_at=now)
     state.last_touched[feat_a] = now
     state.last_touched[feat_b] = now
+    # Clear any in_flight marker — this swap completed cleanly.
+    state.in_flight = None
     slots_mod.write_state(workspace, state)
 
     return {

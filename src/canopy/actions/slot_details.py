@@ -87,11 +87,13 @@ def _enrich_feature_payload(
     GitHub calls beyond what those two paths already make.
     """
     repo_branches = repos_for_feature(workspace, feature)
+    errors: list[dict] = []
     try:
         st = fs.feature_state(workspace, feature)
-    except Exception:
+    except Exception as e:
         st = {"state": "unknown", "summary": {"repos": {}, "prs": {},
                                                  "ci_per_repo": {}}}
+        errors.append({"source": "feature_state", "what": str(e)})
     summary = st.get("summary") or {}
     facts_by_repo: dict[str, dict] = summary.get("repos") or {}
     prs_by_repo: dict[str, dict] = summary.get("prs") or {}
@@ -105,17 +107,19 @@ def _enrich_feature_payload(
 
     try:
         bot_roll = bot_status.bot_comments_status(workspace, feature)
-    except Exception:
+    except Exception as e:
         bot_roll = {"repos": {}}
+        errors.append({"source": "bot_status", "what": str(e)})
     bot_repos = bot_roll.get("repos") or {}
 
     try:
         lane = FeatureCoordinator(workspace).status(feature)
         linear_issue = getattr(lane, "linear_issue", "") or None
         linear_url = getattr(lane, "linear_url", "") or None
-    except Exception:
+    except Exception as e:
         linear_issue = None
         linear_url = None
+        errors.append({"source": "coordinator.status", "what": str(e)})
 
     repos_out: dict[str, dict] = {}
     for repo_name, expected_branch in repo_branches.items():
@@ -150,6 +154,10 @@ def _enrich_feature_payload(
         # last_visit lands with the feature-resume plan; reserved here so
         # the shape is stable when that plan ships.
         "last_visit": None,
+        # Empty list when all enrichment sources succeeded. Populated with
+        # ``{source, what}`` dicts when a source raised — surfaces real
+        # bugs that previously vanished into bare ``except Exception``.
+        "errors": errors,
     }
 
 

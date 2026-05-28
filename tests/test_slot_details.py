@@ -29,3 +29,17 @@ def test_rich_shape_canonical_carries_repos(workspace_with_slots):
     assert "feature_state" in canonical
     assert canonical["slot_id"] == "canonical"
     assert canonical["feature"] == "X"
+
+
+def test_rich_slots_records_errors_from_failed_sources(workspace_with_slots, monkeypatch):
+    """When feature_state raises, rich_slots returns the slot with errors populated."""
+    from canopy.actions import slot_details
+
+    def boom(*a, **k):
+        raise RuntimeError("simulated fs crash")
+
+    monkeypatch.setattr("canopy.actions.feature_state.feature_state", boom)
+    data = slot_details.rich_slots(workspace_with_slots)
+    slot1 = data["slots"]["worktree-1"]
+    assert isinstance(slot1.get("errors"), list)
+    assert any("feature_state" in e.get("source", "") for e in slot1["errors"])

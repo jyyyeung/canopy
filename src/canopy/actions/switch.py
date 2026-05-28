@@ -100,6 +100,7 @@ def switch(
         workspace, feature_name, repo_branches,
         release_current=release_current,
         no_evict=no_evict and (evict is None),
+        evict_to=evict_to,
     )
 
     out: dict[str, Any] = {"feature": feature_name}
@@ -109,11 +110,20 @@ def switch(
 
     # Step A: optional eviction (active-rotation cap fire) —
     # explicit ``evict=<feature>`` overrides preflight's LRU pick.
+    # When ``evict_to`` is pinned to an occupied slot, evict that slot's
+    # occupant first so X can land there.
     eviction_info: dict[str, Any] | None = None
     eviction_target: str | None = None
     if not release_current:
         if evict:
             eviction_target = evict
+        elif evict_to is not None:
+            # Pinned destination — if it holds an occupant other than Y, evict it.
+            cur_state = slots_mod.read_state(workspace)
+            if cur_state is not None and evict_to in cur_state.slots:
+                occ = cur_state.slots[evict_to].feature
+                if occ and occ != feature_name:
+                    eviction_target = occ
         elif pre["cap_will_fire"] and pre["lru_eviction_candidate"]:
             eviction_target = pre["lru_eviction_candidate"]
         if eviction_target:
