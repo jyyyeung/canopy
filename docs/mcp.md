@@ -24,7 +24,7 @@ Register in any MCP-compatible client. `canopy init` writes this entry into the 
 
 `CANOPY_ROOT` scopes the server to one workspace. To use canopy in multiple workspaces simultaneously, register separate entries with different `CANOPY_ROOT` values (or scope MCP per-project via `.mcp.json` at each workspace root).
 
-### Tools (43)
+### Tools (64)
 
 Grouped by topic. Every tool is alias-aware where it accepts a feature input.
 
@@ -33,13 +33,13 @@ Grouped by topic. Every tool is alias-aware where it accepts a feature input.
 | Tool | Description |
 |---|---|
 | `version` | `{cli_version, mcp_version, schema_version}` for the doctor handshake. The extension calls this once at startup; the doctor uses it to flag CLI/MCP version drift. |
-| `doctor` | Diagnose state-file integrity + install staleness; optionally repair. 17 categories, single tool. **The recovery entry point** — when any other call returns an unexpected error, agents should call `doctor` first to see whether state is corrupted. Returns `{issues, summary, fixed, skipped, ...}`. |
+| `doctor` | Diagnose state-file integrity + install staleness; optionally repair. 21 codes across 12 categories — including slot-state checks added in Wave 3.0 (`slot_dir_orphan`, `slot_entry_orphan`, `slot_branch_mismatch`, `slot_detached_head`). **The recovery entry point** — when any other call returns an unexpected error, agents should call `doctor` first to see whether state is corrupted. Returns `{issues, summary, fixed, skipped, ...}`. |
 
 #### Workspace
 
 | Tool | Description |
 |---|---|
-| `workspace_status` | Full workspace status across all repos |
+| `workspace_status` | Full workspace status across all repos. Slot occupancy is reported separately — call `slots` (or `worktree_info`) for the slot-keyed view. |
 | `workspace_context` | Detect canopy context from a directory path |
 | `workspace_config` | Read or write workspace settings |
 | `workspace_reinit` | Rescan repos and regenerate `canopy.toml` |
@@ -65,12 +65,22 @@ Grouped by topic. Every tool is alias-aware where it accepts a feature input.
 | `feature_memory` | **M4.** Read the rendered memory file as markdown — `{feature, memory: <markdown or "">}`. |
 | `historian_compact` | **M4.** Trim the Sessions section to the most-recent N (default 5). Resolutions log + PR context are always preserved. |
 
+#### Slots (Wave 3.0)
+
+| Tool | Description |
+|---|---|
+| `slots` | Slot occupancy + (default) per-slot enrichment for the dashboard / agent. With `rich=True` (default), returns the full payload: per-repo branch, dirty + counts, ahead/behind, default branch, last commit, PR + CI rollup, unresolved bot threads, linear link, and the computed `feature_state` for every occupied slot AND canonical. Empty slots are explicit `null`. With `rich=False`, returns the lightweight `slots.json` shape (slot id → feature + last_touched). |
+| `slot_load` | Warm a cold feature into a slot **without** changing canonical. `slot_id` defaults to the lowest free slot. `replace=True` evicts the current occupant to cold first. `bootstrap=True` runs env-file copy + install_cmd + IDE workspace gen after load. Raises `worktree_cap_reached` when all slots are full and `replace=False`. The feature must be registered (`feature_create`) first — no silent "treat as all repos" fallback. |
+| `slot_clear` | Evict the occupant of a slot to cold (with feature-tagged stash if dirty). The slot id remains; only the occupant moves. |
+| `slot_swap` | Exchange the occupants of two slots. v1 requires identical repo scope on both features; mismatched scope raises `BlockerError(code='swap_scope_mismatch')`. |
+| `migrate_slots` | One-shot migration from pre-3.0 layout to the 3.0 slot model. Renames `.canopy/worktrees/<feature>/` → `worktree-N/`, rewrites canopy.toml (`max_worktrees` → `slots`), migrates `active_feature.json` → `slots.json`. Idempotency-guarded — refuses if `slots.json` already exists. Returns `{moved, slots, canonical, slot_count}`. |
+
 #### Action (Wave 2)
 
 | Tool | Description |
 |---|---|
 | `triage` | Prioritized list of features needing attention. Cross-repo PR fetch, grouped by feature, sorted by review state. |
-| `switch` | **The focus primitive (Wave 2.9).** Promote a feature to the canonical slot. Active rotation (default) evacuates the previously-canonical feature to a warm worktree; `release_current=True` (wind-down) sends it to cold with a feature-tagged stash. Cap-reached blocker surfaces explicit fix actions. See [docs/concepts.md §4](concepts.md#4-the-canonical-slot-model). |
+| `switch` | **The focus primitive (Wave 3.0 slot model).** Promote a feature to the canonical slot. Active rotation (default) evacuates the previously-canonical feature into a warm slot; `release_current=True` (wind-down) sends it to cold with a feature-tagged stash. When the destination is already warm, the swap is a fast 5-op-per-repo dance — no `mv`, no slot renaming. Slot-targeted args: `evict_to=<slot-N>` pins where the outgoing canonical lands; `to_slot=<slot-N>` promotes whatever feature occupies that slot (omit `feature`). Cap-reached blocker surfaces explicit fix actions. See [docs/concepts.md §4](concepts.md#4-the-slot-model). |
 | `drift` | Cached alignment view from `.canopy/state/heads.json`. Fast, hook-driven. |
 
 #### Read primitives (alias-aware)
@@ -106,8 +116,8 @@ Grouped by topic. Every tool is alias-aware where it accepts a feature input.
 
 | Tool | Description |
 |---|---|
-| `worktree_create` | Create worktrees for a feature (optionally linked to a Linear issue) |
-| `worktree_info` | Live worktree state |
+| `worktree_create` | Create a feature with worktrees in numbered slots (`.canopy/worktrees/worktree-N/<repo>/`). Allocates the lowest free slot; returns `slot_id` alongside `worktree_paths` so callers can reference the slot directly. Optionally linked to a Linear issue. |
+| `worktree_info` | Live worktree state — slot-keyed map (`{worktree-N: {feature, repos: {<repo>: {branch, dirty, dirty_count, dirty_files, ahead, behind, default_branch, path}}}}`) plus the per-repo `git worktree list` from the main working tree. |
 | `branch_list` / `branch_delete` / `branch_rename` | Branch ops across repos |
 | `log` | Interleaved commit log across repos |
 | `checkout` | Checkout a branch across repos |

@@ -20,6 +20,11 @@ Canopy also returns **pre-classified state**: review comments are temporally fil
 | What feature should I work on right now? | `mcp__canopy__triage` | per-repo `gh pr list` + manual grouping |
 | Show me everything about a feature | `mcp__canopy__feature_state` | composing many reads yourself |
 | Promote a feature to the canonical slot (the focus primitive) | `mcp__canopy__switch` | `cd repo && git checkout` per repo, or guessing paths |
+| Inspect slot occupancy (dashboard grid) | `mcp__canopy__slots(rich=True)` | hand-rolling `ls .canopy/worktrees/` + per-slot `feature_state` |
+| Pre-warm a cold feature into a slot without changing canonical | `mcp__canopy__slot_load(feature, slot_id?)` | `mcp__canopy__switch` (changes canonical too) |
+| Free a slot without bringing a new feature in | `mcp__canopy__slot_clear(slot_id)` | manual stash + branch checkout |
+| Exchange two slots' occupants | `mcp__canopy__slot_swap(slot_a, slot_b)` | two `slot_load` calls with `replace=True` |
+| Migrate a pre-3.0 workspace to the slot model | `mcp__canopy__migrate_slots` | hand-renaming `.canopy/worktrees/` dirs |
 | Hibernate current focus + start something new | `mcp__canopy__switch(feature, release_current=True)` *(`release_current` is the API param; user-facing label is "hibernate")* | manual stash + checkout dance |
 | Commit across the canonical feature (one message, all repos) | `mcp__canopy__commit(message=...)` *(canonical feature inferred; pass `feature=` for non-canonical)* | `mcp__canopy__run(... 'git commit')` per repo |
 | Push the canonical feature to origin | `mcp__canopy__push()` *(add `set_upstream=True` on first push; the `no_upstream` blocker tells you when)* | `mcp__canopy__run(... 'git push')` per repo |
@@ -53,8 +58,25 @@ Every tool that takes a feature accepts the same alias forms — learn one rule,
 - **Specific PR**: `<repo>#<n>` like `backend#142`
 - **PR URL**: `https://github.com/owner/repo/pull/142`
 - **Specific branch**: `<repo>:<branch>` like `backend:feature/x`
+- **Slot id**: `worktree-1`, `worktree-2`, ... — resolves to the slot's current occupant (Wave 3.0). Lets you say "tell me about worktree-2" without first looking up what's in it.
 
 For features whose branch name differs across repos (e.g. `SIN-13-fixes` in backend vs `SIN-13-fixes-v2` in frontend), the lane's `branches` map handles this transparently. You pass the canonical feature alias; canopy resolves per-repo branches.
+
+## Slots (Wave 3.0)
+
+Canopy organizes worktrees into **numbered slots** — `.canopy/worktrees/worktree-1/`, `.canopy/worktrees/worktree-2/`, etc. A slot is a stable disk resource; the feature inside it is a transient tenant. When you `switch` from feature X to feature Y, the slot ids don't change — only which feature occupies which slot.
+
+**Want to see what's in each slot?** Call `mcp__canopy__slots` (defaults to `rich=True`) — returns the full dashboard grid in a single call: canonical + every warm slot, each with per-repo branch / dirty / ahead-behind / PR / CI / bot threads / linear / computed `feature_state`. Empty slots come back as explicit `null`.
+
+The slot vocabulary (CLI + MCP parity):
+
+- `mcp__canopy__switch(feature)` — promote a feature to canonical. Slot rotation is automatic. `evict_to=<slot-N>` pins where the outgoing canonical lands; `to_slot=<slot-N>` promotes whatever feature already sits in that slot.
+- `mcp__canopy__slot_load(feature, slot_id?)` — warm a cold feature into a slot **without** changing canonical. Use this to pre-warm a slot before review or before a planned switch. `replace=True` evicts the current occupant to cold first.
+- `mcp__canopy__slot_clear(slot_id)` — evict that slot's occupant to cold (with feature-tagged stash if dirty). The slot itself remains.
+- `mcp__canopy__slot_swap(slot_a, slot_b)` — exchange the occupants. v1 requires identical repo scope on both features.
+- `mcp__canopy__migrate_slots()` — one-shot migration from a pre-3.0 workspace (where worktrees were named after their feature). Idempotent. Run once per workspace if `BlockerError(code='pre_migration')` ever surfaces.
+
+**Canonical is the only place to run code.** Slots are passive branch storage. Never `cd` into `.canopy/worktrees/worktree-N/` to launch the app, run tests, or open a dev server — switch the feature into canonical first (`mcp__canopy__switch(feature)`). If you need to *inspect* a warm slot's files without changing focus, that's fine (read-only Read / Grep is harmless), but anything that runs the project should happen against canonical.
 
 ## Errors are structured — read them
 
@@ -80,7 +102,7 @@ When you see a `BlockerError`, the first step is to read `fix_actions[0]` and de
 
 ## Recovery: when canopy itself looks broken
 
-If a canopy call returns an unexpected error — `KeyError` from a state read, a "feature not found" for one you just created, a worktree path that should exist but doesn't — call `mcp__canopy__doctor` first. It reports 17 categories of state-file drift + install-staleness, each with `code`, `severity`, `expected`/`actual`, and an `auto_fixable` flag.
+If a canopy call returns an unexpected error — `KeyError` from a state read, a "feature not found" for one you just created, a worktree path that should exist but doesn't — call `mcp__canopy__doctor` first. It reports 21 codes across 12 categories of state-file drift + install-staleness (including slot-state checks added in Wave 3.0: `slot_dir_orphan`, `slot_entry_orphan`, `slot_branch_mismatch`, `slot_detached_head`), each with `code`, `severity`, `expected`/`actual`, and an `auto_fixable` flag.
 
 - `summary.errors == 0` → not a state problem; investigate the original error normally.
 - Errors present, mostly `auto_fixable: true` → call `doctor(fix=True)`; report `fixed`/`skipped` to the user.
@@ -123,7 +145,8 @@ When `mcp__canopy__feature_state` returns state `awaiting_bot_resolution`, only 
 
 ## Anti-patterns
 
-- ❌ `cd <repo> && git checkout <branch>` — use `mcp__canopy__switch(feature=...)` so all participating repos move together with verification (and the previously-canonical feature evacuates to a warm worktree, preserving its work-in-progress).
+- ❌ `cd <repo> && git checkout <branch>` — use `mcp__canopy__switch(feature=...)` so all participating repos move together with verification (and the previously-canonical feature evacuates into a warm slot, preserving its work-in-progress).
+- ❌ `cd .canopy/worktrees/worktree-N/<repo> && pnpm dev` (or `pytest`, or any command that runs the project) — worktrees are passive branch storage. Switch the feature into canonical (`mcp__canopy__switch(feature)`) and run there. Read-only inspection (Read / Grep against a warm slot) is fine; execution is not.
 - ❌ Iterating `gh pr list --author @me` per repo and grouping yourself — `mcp__canopy__triage` already groups by feature lane and applies priority tiers.
 - ❌ `cd <repo> && pnpm test` — use `mcp__canopy__run(repo='repo-b', command='pnpm test')`. The shell state from a previous tool call is not yours.
 - ❌ Parsing `gh api .../pulls/{n}/comments` and writing your own "is this resolved" logic — `mcp__canopy__github_get_pr_comments` returns `actionable_threads` vs `likely_resolved_threads` already.

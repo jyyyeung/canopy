@@ -6,7 +6,7 @@ How AI coding agents (Claude Code primarily; others by analogy) integrate with c
 
 Three pieces, all installed in one step by `canopy init`:
 
-1. **Canopy MCP server** (`canopy-mcp` binary) — 54 tools exposing every canopy operation. Registered in `<workspace>/.mcp.json`.
+1. **Canopy MCP server** (`canopy-mcp` binary) — 64 tools exposing every canopy operation. Registered in `<workspace>/.mcp.json`.
 2. **`using-canopy` skill** at `~/.claude/skills/using-canopy/SKILL.md` — tells the agent *when* to prefer canopy MCP over raw bash.
 3. **Per-workspace MCP config** in `<workspace>/.mcp.json` with `CANOPY_ROOT` set so the server scopes to the right workspace.
 
@@ -67,6 +67,11 @@ The skill encodes this matrix; the agent reads it on session start. Mirror here 
 | Linear issue | `mcp__canopy__linear_get_issue` | direct API |
 | Run shell command in a specific repo | `mcp__canopy__run` | `cd /path && cmd` (path mistake risk) |
 | Stash for a feature | `mcp__canopy__stash_save_feature` | raw `git stash push` |
+| Inspect slot occupancy (dashboard grid) | `mcp__canopy__slots(rich=True)` | hand-rolling `ls .canopy/worktrees/` + per-slot `feature_state` |
+| Pre-warm a cold feature into a slot without changing canonical | `mcp__canopy__slot_load(feature, slot_id?)` | `mcp__canopy__switch` (changes canonical too) |
+| Free a slot without bringing a new feature in | `mcp__canopy__slot_clear(slot_id)` | manual stash + branch checkout |
+| Exchange two slots' occupants (e.g., shuffle warm order) | `mcp__canopy__slot_swap(slot_a, slot_b)` | two `slot_load` calls with `replace=True` |
+| Migrate a pre-3.0 workspace to the slot model | `mcp__canopy__migrate_slots` | hand-renaming `.canopy/worktrees/` dirs |
 
 ### Vocabulary note: hibernate ⇄ release_current
 
@@ -113,10 +118,10 @@ STEP 3: github_get_pr_comments("SIN-12-search")
   [backend]  src/app.py:18 (reviewer) — add a docstring with example response
   [frontend] src/EmptyState.tsx:4 (reviewer) — prefer a discriminated union
 
-STEP 4: agent decides to pivot to SIN-13-empty-state (currently warm)
+STEP 4: agent decides to pivot to SIN-13-empty-state (currently warm in worktree-1)
   switch({"feature": "SIN-13-empty-state"})
     mode=active_rotation
-    previously_canonical=SIN-12-search   (evacuated to warm worktree)
+    previously_canonical=SIN-12-search   (evacuated into worktree-1 — fast 5-op swap)
     per_repo_paths.frontend=/.../canopy-test/frontend  (now on SIN-13)
 
 STEP 5: feature_state("SIN-13-empty-state") confirms in_progress
@@ -145,7 +150,7 @@ Canopy errors come back as structured `BlockerError` / `FailedError`:
      "safe": false,
      "preview": "evict LRU warm worktree 'SIN-14-stale-count' to cold"},
     {"action": "workspace_config",
-     "args": {"max_worktrees": 3},
+     "args": {"slots": 3},
      "safe": true,
      "preview": "raise warm_slot_cap to 3"}
   ]
@@ -160,7 +165,7 @@ When you see a `BlockerError`, read `fix_actions[0]` and decide whether to follo
 
 ### Recovery: when canopy itself looks broken
 
-If a canopy call returns an unexpected error — `KeyError` from a state read, "feature not found" for a feature you just created, a path that should exist but doesn't — call `mcp__canopy__doctor` first. It diagnoses 17 categories of state-file drift and install-staleness, returning each issue with a `code`, `severity`, `expected`, `actual`, and `auto_fixable` flag.
+If a canopy call returns an unexpected error — `KeyError` from a state read, "feature not found" for a feature you just created, a path that should exist but doesn't — call `mcp__canopy__doctor` first. It diagnoses 21 codes across 12 categories of state-file drift and install-staleness (including slot-state checks added in Wave 3.0), returning each issue with a `code`, `severity`, `expected`, `actual`, and `auto_fixable` flag.
 
 Typical recovery flow:
 

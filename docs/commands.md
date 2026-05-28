@@ -11,7 +11,8 @@ Organized by **workflow stage** — top to bottom matches a typical day.
 | `canopy init [path]` | Discover repos, write `canopy.toml`, install drift hooks, register the `using-canopy` skill, add canopy MCP to `.mcp.json`. Use `--no-agent` to skip the skill + MCP bits. |
 | `canopy setup-agent` | Install (or refresh) the agent integration only — skill + MCP. `--check` reports status. `--reinstall` forces overwrite. `--skill-only` / `--mcp-only` for partial installs. |
 | `canopy hooks install\|uninstall\|status` | Manage the post-checkout hooks per repo. Hooks are what feed `.canopy/state/heads.json`. |
-| `canopy config [key] [value]` | Read/write workspace settings (e.g. `max_worktrees`). |
+| `canopy config [key] [value]` | Read/write workspace settings (e.g. `slots`). |
+| `canopy migrate-slots` | **Wave 3.0.** One-shot migration from pre-3.0 feature-named worktrees (`.canopy/worktrees/<feature>/<repo>/`) to the slot model (`.canopy/worktrees/worktree-N/<repo>/`). Renames dirs, rewrites canopy.toml (`max_worktrees` → `slots`), migrates `active_feature.json` → `slots.json`. Dry-run preflight; refuses on dirty trees. Idempotent — refuses to re-run when `slots.json` already exists. |
 
 ## Discover
 
@@ -25,6 +26,7 @@ Organized by **workflow stage** — top to bottom matches a typical day.
 | `canopy feature list` | Same as `list` (legacy spelling). |
 | `canopy feature status <name>` | Detailed per-repo state + merge-readiness check. |
 | `canopy worktree` | Live worktree dashboard — branch, dirty state, ahead/behind per linked worktree. |
+| `canopy slots [--rich]` | **Wave 3.0.** Slot occupancy snapshot — what's in canonical and each warm slot, plus the `last_touched` LRU. `--rich` (implied by `--json`) enriches each slot with branch, dirty, ahead/behind, PR + CI rollup, unresolved bot threads, linear link, and the computed `feature_state` per repo — the same payload the dashboard renders. |
 | `canopy log [--feature <f>]` | Interleaved chronological log across repos. |
 
 ## Read
@@ -47,7 +49,10 @@ Write actions and execution.
 
 | Command | What it does |
 |---|---|
-| `canopy switch <feature> [--release-current] [--no-evict] [--evict <f>]` | **The focus primitive (Wave 2.9).** Promote a feature to the canonical slot. Default (active rotation): previously-canonical evacuates to a warm worktree (full stash → checkout → pop). `--release-current` (wind-down): previous goes cold with a feature-tagged stash. Cap-reached blocker surfaces explicit fix actions (wind-down, evict by name, raise cap). See [docs/concepts.md §4](concepts.md#4-the-canonical-slot-model). |
+| `canopy switch <feature> [--release-current] [--no-evict] [--evict <f>] [--evict-to <slot-N>] [--to-slot <slot-N>]` | **The focus primitive (Wave 3.0 slot model).** Promote a feature to the canonical slot. Default (active rotation): previously-canonical evacuates into a warm slot (full stash → checkout → pop). When the destination is already warm, the swap is a fast 5-op-per-repo dance — no `mv`, no slot renaming. `--release-current` (wind-down): previous goes cold with a feature-tagged stash. `--evict-to <slot-N>` pins which slot the outgoing canonical lands in. `--to-slot <slot-N>` promotes whatever feature already occupies that slot (omit `<feature>`). Cap-reached blocker surfaces explicit fix actions (wind-down, evict a specific slot, raise cap). See [docs/concepts.md §4](concepts.md#4-the-slot-model). |
+| `canopy slot load <feature> [<slot-N>] [--replace] [--bootstrap]` | **Wave 3.0.** Warm a cold feature into a slot WITHOUT changing canonical. `<slot-N>` defaults to the lowest free slot. `--replace` evicts the slot's current occupant to cold first. `--bootstrap` runs the env-file copy + install_cmd + IDE workspace gen (same as `canopy worktree-bootstrap`). The feature must already be registered — create it with `canopy feature create` first. |
+| `canopy slot clear <slot-N>` | **Wave 3.0.** Evict that slot's occupant to cold with a feature-tagged stash if dirty. The slot id stays — only the occupant moves. |
+| `canopy slot swap <slot-A> <slot-B>` | **Wave 3.0.** Exchange the features in two warm slots. v1 requires identical repo scope on both features (mismatched-scope swap raises `BlockerError(code='swap_scope_mismatch')`). |
 | `canopy checkout <branch>` | Plain checkout across all repos — no feature context, no per-repo branch resolution. Use `switch` for feature-scoped focus changes. |
 | `canopy run <repo> <command> [--feature]` | Run a shell command in a canopy-managed repo with cwd resolved internally. The "agent never `cd`s" tool — also useful from a CLI in a deeply nested directory. |
 | `canopy code\|cursor\|fork <feature\|.>` | Open the feature in VS Code / Cursor / Fork.app (alias-aware; generates `.code-workspace` for the IDE ones). |
@@ -77,7 +82,7 @@ Write actions and execution.
 
 | Command | What it does |
 |---|---|
-| `canopy worktree <name> [issue]` | Create linked worktrees for a feature in every repo, optionally linking a Linear issue. Worktrees go to `.canopy/worktrees/<feature>/<repo>/`. |
+| `canopy worktree <name> [issue]` | Create linked worktrees for a feature in every repo, optionally linking a Linear issue. Worktrees go to `.canopy/worktrees/worktree-N/<repo>/` (generic numbered slot, allocated as the lowest free slot). The allocated slot id is returned in the response. |
 | `canopy worktree` | Live dashboard (read-only, see "Discover"). |
 
 ## Branch
@@ -99,9 +104,9 @@ Write actions and execution.
 
 | Command | What it does |
 |---|---|
-| `canopy doctor [-v] [--feature <f>]` | Diagnose 17 categories of state-file drift + install staleness (incl. `mcp_orphans` from F-3). Reports `errors`/`warnings`/`info` with structured `code`, `expected`, `actual`, and per-issue `fix_action`. **Run this first** when any other canopy operation returns an unexpected error — most "something is off" cases trace to one of these categories. `--json` returns the full report shape `{issues, summary, fixed, skipped}`. |
-| `canopy doctor --fix` | Repair every `auto_fixable=true` issue. Examples: rewrite `heads.json` from live git, drop orphan worktree dirs via `git worktree remove --force`, reinstall a missing post-checkout hook, re-resolve broken `active_feature.json` paths, write a missing `.mcp.json` entry, reinstall the `using-canopy` skill. |
-| `canopy doctor --fix-category <c>` | Repair just one category (`heads`, `active_feature`, `worktrees`, `hooks`, `preflight`, `features`, `branches`, `cli`, `mcp`, `skill`, `vsix`). Implies `--fix`. |
+| `canopy doctor [-v] [--feature <f>]` | Diagnose 21 codes across 12 categories of state-file drift + install staleness (incl. slot-state checks added in Wave 3.0). Reports `errors`/`warnings`/`info` with structured `code`, `expected`, `actual`, and per-issue `fix_action`. **Run this first** when any other canopy operation returns an unexpected error — most "something is off" cases trace to one of these categories. `--json` returns the full report shape `{issues, summary, fixed, skipped}`. |
+| `canopy doctor --fix` | Repair every `auto_fixable=true` issue. Examples: rewrite `heads.json` from live git, drop orphan worktree dirs via `git worktree remove --force`, reinstall a missing post-checkout hook, clean up an orphan slot dir, write a missing `.mcp.json` entry, reinstall the `using-canopy` skill. |
+| `canopy doctor --fix-category <c>` | Repair just one category (`heads`, `slots`, `active_feature`, `worktrees`, `hooks`, `preflight`, `features`, `branches`, `cli`, `mcp`, `skill`, `vsix`). Implies `--fix`. |
 | `canopy doctor --clean-vsix` | Required gate for the destructive `vsix_duplicates` repair (removes all but the newest `singularityinc.canopy-*` install dir). Other repairs are unaffected. |
 | `canopy --version` | Print the installed CLI version. |
 
@@ -116,6 +121,10 @@ State-integrity (the workspace's own bookkeeping):
 | `active_feature_path_missing` | error | `per_repo_paths` reference non-existent dirs | re-resolve from `features.json` |
 | `worktree_orphan` | warn | `.canopy/worktrees/<f>/<r>/` not referenced by any feature | `git worktree remove --force` |
 | `worktree_missing` | error | feature × repo `worktree_paths` entry has no dir on disk | drop the entry |
+| `slot_dir_orphan` | warn | `.canopy/worktrees/worktree-N/` exists with no entry in `slots.json` | drop the dir (Wave 3.0) |
+| `slot_entry_orphan` | warn | `slots.json` references a slot whose dir is missing | drop the entry (Wave 3.0) |
+| `slot_branch_mismatch` | error | slot's repo HEAD ≠ recorded feature branch | manual (decide which is canonical: live HEAD or slots.json) |
+| `slot_detached_head` | info | slot's repo is on a detached HEAD (bisect / explicit checkout `<sha>`) | manual (informational; common during bisect — re-attach when done) |
 | `hook_missing` | error | repo lacks canopy's post-checkout hook | reinstall (chains existing user hook) |
 | `hook_chained_unsafe` | warn | chained user hook present but not executable | `chmod +x` |
 | `preflight_stale` | info | recorded `head_sha_per_repo` no longer matches live HEAD | drop the entry |
@@ -155,16 +164,29 @@ canopy push                # publish (add --set-upstream on first push)
 canopy state <feature>     # confirm transition
 ```
 
-Switching focus mid-flight (canonical-slot model):
+Switching focus mid-flight (Wave 3.0 slot model):
 
 ```bash
-# Active rotation: previous focus evacuates to a warm worktree, instant to switch back
+# Active rotation: previous focus evacuates into a warm slot, instant to switch back
 canopy switch other-feature
 # ... work on other-feature ...
-canopy switch current-feature   # warm worktree promotes back to canonical
+canopy switch current-feature   # the warm slot's occupant promotes back to canonical
 
 # Wind-down: previous focus goes cold (feature-tagged stash if dirty)
 canopy switch new-feature --release-current
+
+# Inspect slot occupancy + per-slot PR/CI/bots
+canopy slots --rich
+
+# Pre-warm a cold feature into a slot without changing canonical
+canopy slot load other-feature           # picks lowest free slot
+canopy slot load other-feature worktree-2 # pin slot 2
+
+# Free a slot without bringing a new feature in
+canopy slot clear worktree-2
+
+# Swap two slots (identical scope required in v1)
+canopy slot swap worktree-1 worktree-2
 ```
 
 Investigate without changing state:
