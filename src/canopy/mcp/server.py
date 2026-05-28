@@ -258,6 +258,27 @@ def switch(feature: str, release_current: bool = False,
 
 
 @mcp.tool()
+def slot_load(
+    feature: str, slot_id: str | None = None,
+    replace: bool = False, bootstrap: bool = False,
+) -> dict:
+    """Warm a cold feature into a slot WITHOUT changing canonical.
+
+    Use `switch` to actually make a feature the active workspace; use
+    `slot_load` to pre-warm a slot for fast future switching, or to load
+    a feature for inspection (e.g. before review) without disturbing the
+    canonical.
+
+    slot_id defaults to the lowest free slot. Raises worktree_cap_reached
+    when all slots are full. With replace=True, evicts the slot's
+    current occupant to cold first.
+    """
+    from ..actions.slot_load import slot_load as _impl
+    return _impl(_get_workspace(), feature,
+                 slot_id=slot_id, replace=replace, bootstrap=bootstrap)
+
+
+@mcp.tool()
 def commit(message: str = "", feature: str | None = None,
            repos: list[str] | None = None, paths: list[str] | None = None,
            no_hooks: bool = False, amend: bool = False,

@@ -937,6 +937,24 @@ def cmd_slots(args: argparse.Namespace) -> None:
     console.print()
 
 
+def cmd_slot_load(args: argparse.Namespace) -> None:
+    """Warm a cold feature into a slot without changing canonical."""
+    from ..actions.slot_load import slot_load
+    from .ui import console
+
+    workspace = _load_workspace()
+    result = slot_load(
+        workspace, args.feature,
+        slot_id=args.slot_id, replace=args.replace, bootstrap=args.bootstrap,
+    )
+    if args.json:
+        _print_json(result)
+        return
+    console.print(f"[ok]Loaded[/] [info]{result['feature']}[/] into [info]{result['slot_id']}[/]")
+    if result.get("evicted"):
+        console.print(f"  Evicted: [muted]{result['evicted']['feature']}[/]")
+
+
 def cmd_migrate_slots(args: argparse.Namespace) -> None:
     """One-shot migration from pre-3.0 layout to 3.0 slot model."""
     from ..actions.migrate_slots import migrate, AlreadyMigratedError, NotLegacyError
@@ -3407,6 +3425,19 @@ def main() -> None:
     slots_p.add_argument("--rich", action="store_true",
                           help="Include per-slot PR/CI/bots/linear (implied by --json)")
 
+    # slot (sub-command group for slot operations)
+    slot_p = subparsers.add_parser("slot", help="Slot-targeted operations")
+    slot_sub = slot_p.add_subparsers(dest="slot_cmd", required=True)
+    slot_load_p = slot_sub.add_parser("load", help="Warm a cold feature into a slot")
+    slot_load_p.add_argument("feature")
+    slot_load_p.add_argument("slot_id", nargs="?", default=None,
+                              help="Target slot id (e.g. worktree-1); defaults to lowest free")
+    slot_load_p.add_argument("--replace", action="store_true",
+                              help="Evict slot's current occupant first")
+    slot_load_p.add_argument("--bootstrap", action="store_true",
+                              help="Run env/install bootstrap after load")
+    slot_load_p.add_argument("--json", action="store_true")
+
     # migrate-slots
     migrate_slots_p = subparsers.add_parser(
         "migrate-slots",
@@ -3701,6 +3732,11 @@ def main() -> None:
             "drop": cmd_stash_drop,
         }
         stash_commands[args.stash_command](args)
+    elif args.command == "slot":
+        slot_commands = {
+            "load": cmd_slot_load,
+        }
+        slot_commands[args.slot_cmd](args)
     elif args.command in commands:
         commands[args.command](args)
     else:
