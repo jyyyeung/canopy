@@ -114,8 +114,8 @@ def preflight(
         post_switch_warm = (already_warm - {feature_to_activate}) | {previously_canonical}
         if len(post_switch_warm) > cap:
             cap_will_fire = True
-            lru_eviction_candidate = _pick_lru(
-                state, candidates=post_switch_warm - {previously_canonical},
+            lru_eviction_candidate = slots_mod.lru_evictee(
+                state, exclude={feature_to_activate},
             )
             if no_evict or lru_eviction_candidate is None:
                 issues.append({
@@ -183,23 +183,3 @@ def preflight(
         "lru_eviction_candidate": lru_eviction_candidate,
         "previously_canonical": previously_canonical,
     }
-
-
-def _pick_lru(
-    state: slots_mod.SlotState | None,
-    *,
-    candidates: set[str],
-) -> str | None:
-    """Pick the least-recently-touched feature from ``candidates``.
-
-    Reads ``state.last_touched``. Features not in the map are considered
-    older than any feature with a recorded timestamp (lexicographically
-    sorted as a tiebreaker for determinism).
-    """
-    if not candidates:
-        return None
-    if state is None or not state.last_touched:
-        # No recency info — fall back to lexicographic order for determinism
-        return sorted(candidates)[0]
-    # Sort by (timestamp_or_empty, name)
-    return sorted(candidates, key=lambda f: (state.last_touched.get(f, ""), f))[0]
