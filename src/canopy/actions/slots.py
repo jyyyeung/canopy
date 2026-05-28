@@ -10,10 +10,18 @@ Schema::
       "canonical": {feature, activated_at, per_repo_paths},
       "previous_canonical": str | null,
       "slots": {"worktree-1": {feature, occupied_at}, ...},
-      "last_touched": {feature: iso, ...}
+      "last_touched": {feature: iso, ...},
+      "in_flight": {feature_being_promoted, previously_canonical,
+                     started_at, per_repo_completed, failed_repo,
+                     error_what} | null
     }
 
-Validation on read: missing canonical paths → return None (stale).
+Validation on read: a missing canonical path clears ``canonical`` only —
+the slots/last_touched maps are independent of the canonical pointer and
+must NOT be discarded when the canonical entry is stale. Catastrophic
+cases (file missing, JSON unparseable, top-level not a dict) still
+return None.
+
 Missing slot dirs → silently drop from the returned state.
 """
 from __future__ import annotations
@@ -50,6 +58,7 @@ class SlotState:
     previous_canonical: str | None = None
     slots: dict[str, SlotEntry] = field(default_factory=dict)
     last_touched: dict[str, str] = field(default_factory=dict)
+    in_flight: dict | None = None
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {
@@ -61,6 +70,7 @@ class SlotState:
                 for sid, e in self.slots.items()
             },
             "last_touched": dict(self.last_touched),
+            "in_flight": dict(self.in_flight) if self.in_flight else None,
         }
         if self.canonical is not None:
             d["canonical"] = {
@@ -96,21 +106,26 @@ def read_state(workspace: Workspace) -> SlotState | None:
     if not isinstance(data, dict):
         return None
 
-    # Canonical staleness check
+    # Canonical staleness check — stale canonical is NOT fatal to the
+    # rest of the state. Slots and last_touched are independent of the
+    # canonical pointer; clear canonical only and preserve the rest.
     canonical_raw = data.get("canonical")
     canonical: CanonicalEntry | None = None
     if isinstance(canonical_raw, dict) and canonical_raw.get("feature"):
         per_repo = canonical_raw.get("per_repo_paths") or {}
         if not isinstance(per_repo, dict):
-            return None
-        for p in per_repo.values():
-            if not Path(p).exists():
-                return None  # stale
-        canonical = CanonicalEntry(
-            feature=canonical_raw["feature"],
-            activated_at=canonical_raw.get("activated_at", ""),
-            per_repo_paths=dict(per_repo),
-        )
+            # Malformed canonical block — treat as no canonical, keep rest.
+            canonical = None
+        else:
+            stale = any(not Path(p).exists() for p in per_repo.values())
+            if stale:
+                canonical = None
+            else:
+                canonical = CanonicalEntry(
+                    feature=canonical_raw["feature"],
+                    activated_at=canonical_raw.get("activated_at", ""),
+                    per_repo_paths=dict(per_repo),
+                )
 
     slots_raw = data.get("slots") or {}
     slots_root = _slots_root(workspace)
@@ -126,6 +141,11 @@ def read_state(workspace: Workspace) -> SlotState | None:
             occupied_at=entry.get("occupied_at", ""),
         )
 
+    in_flight_raw = data.get("in_flight")
+    in_flight = (
+        dict(in_flight_raw) if isinstance(in_flight_raw, dict) else None
+    )
+
     return SlotState(
         slot_count=int(data.get("slot_count", 2)),
         canonical=canonical,
@@ -134,6 +154,7 @@ def read_state(workspace: Workspace) -> SlotState | None:
         last_touched={
             str(k): str(v) for k, v in (data.get("last_touched") or {}).items()
         },
+        in_flight=in_flight,
     )
 
 

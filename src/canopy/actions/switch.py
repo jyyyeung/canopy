@@ -60,6 +60,7 @@ def switch(
     evacuation?, eviction?, branches_created?, migration?}``.
     """
     _ensure_post_migration(workspace)
+    _ensure_consistent(workspace)
     feature_name = resolve_feature_safely(workspace, feature)
 
     repo_branches = repos_for_feature(workspace, feature_name)
@@ -117,12 +118,26 @@ def switch(
                 per_repo_results=per_repo_results,
                 new_canonical_paths=new_canonical_paths,
             )
-        except BlockerError:
+        except BlockerError as e:
+            # Even a structured precondition failure (e.g. dirty warm
+            # worktree on the second repo) can leave disk partially
+            # mutated by earlier repos. Persist an in_flight marker so
+            # the next switch refuses to operate on a lie.
+            _persist_in_flight(
+                workspace, feature_name, previously_canonical,
+                failed_repo=repo_name, error_what=e.what or str(e),
+                completed_results=per_repo_results,
+            )
             raise
         except Exception as e:
             # Mid-op failure with no rollback walker (yet). Surface enough
             # state for the user to recover manually instead of leaving
             # them with a generic exception. See GitHub issue #2.
+            _persist_in_flight(
+                workspace, feature_name, previously_canonical,
+                failed_repo=repo_name, error_what=str(e),
+                completed_results=per_repo_results,
+            )
             raise _build_mid_op_error(
                 workspace, feature_name, repo_name, target_branch,
                 previously_canonical, e, per_repo_results,
@@ -401,6 +416,9 @@ def _post_switch_persist(
         if entry.feature == feature_name:
             del state.slots[sid]
 
+    # Clear any in_flight marker — this switch completed cleanly.
+    state.in_flight = None
+
     slots_mod.write_state(workspace, state)
     out["activated_at"] = now
     if state.previous_canonical:
@@ -572,6 +590,74 @@ def _create_missing_branches(
             "base": base, "created_from_sha": base_sha,
         })
     return out
+
+
+# ── partial-failure marker ──────────────────────────────────────────────
+
+def _persist_in_flight(
+    workspace: Workspace,
+    feature_being_promoted: str,
+    previously_canonical: str | None,
+    *,
+    failed_repo: str,
+    error_what: str,
+    completed_results: list[dict[str, Any]],
+) -> None:
+    """Stamp ``slots.json`` with an in_flight marker so the next switch
+    refuses to run on a half-flipped workspace.
+
+    Captures: what we were trying to do, what completed before the crash,
+    which repo blew up, and the underlying error message. Cleared on the
+    next successful switch via ``_post_switch_persist``.
+    """
+    state = slots_mod.read_state(workspace) or slots_mod.SlotState(
+        slot_count=workspace.config.slots,
+    )
+    state.in_flight = {
+        "feature_being_promoted": feature_being_promoted,
+        "previously_canonical": previously_canonical,
+        "started_at": slots_mod.now_iso(),
+        "per_repo_completed": [
+            {k: v for k, v in r.items()} for r in completed_results
+        ],
+        "failed_repo": failed_repo,
+        "error_what": error_what,
+    }
+    slots_mod.write_state(workspace, state)
+
+
+def _ensure_consistent(workspace: Workspace) -> None:
+    """Refuse to switch when an in_flight marker is set.
+
+    A prior switch left the workspace in a partial state (some repos
+    flipped to Y, others still on X). Continuing would compound the
+    inconsistency. Surface a structured blocker; T19 will extend doctor
+    to actually repair this.
+    """
+    state = slots_mod.read_state(workspace)
+    if state is None or state.in_flight is None:
+        return
+    inf = state.in_flight
+    raise BlockerError(
+        code="slot_state_inconsistent",
+        what=(
+            f"a prior switch to '{inf.get('feature_being_promoted')}' failed in "
+            f"repo '{inf.get('failed_repo')}' — workspace is partially flipped"
+        ),
+        details={"in_flight": dict(inf)},
+        fix_actions=[
+            FixAction(
+                action="doctor",
+                args={},
+                safe=True,
+                preview=(
+                    "run `canopy doctor` to inspect slots.json and the "
+                    "completed-vs-failed per-repo work; resolve manually, "
+                    "then clear the in_flight marker"
+                ),
+            ),
+        ],
+    )
 
 
 # ── pre-3.0 migration gate ──────────────────────────────────────────────

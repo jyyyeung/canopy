@@ -38,17 +38,72 @@ def test_write_then_read_roundtrip(canopy_toml):
     assert loaded.last_touched["doc-3010"] == "2026-05-26T14:00:00Z"
 
 
-def test_read_returns_none_if_canonical_path_missing(canopy_toml, tmp_path):
+def test_read_clears_canonical_when_path_missing(canopy_toml, tmp_path):
+    """Stale canonical path clears `canonical` but preserves slots and
+    last_touched. The slot map is independent of the canonical pointer."""
     ws = Workspace(load_config(canopy_toml))
+    # worktree-1 dir must exist for read_state to keep the slot
+    (canopy_toml / ".canopy" / "worktrees" / "worktree-1").mkdir(
+        parents=True, exist_ok=True,
+    )
     state = slots.SlotState(
         slot_count=2,
         canonical=slots.CanonicalEntry(
             feature="x", activated_at="2026-05-28T10:00:00Z",
             per_repo_paths={"repo-a": str(tmp_path / "ghost")},
         ),
+        previous_canonical="prev",
+        slots={"worktree-1": slots.SlotEntry(
+            feature="warm-feat", occupied_at="2026-05-26T14:00:00Z",
+        )},
+        last_touched={"x": "2026-05-28T10:00:00Z",
+                      "warm-feat": "2026-05-26T14:00:00Z"},
     )
     slots.write_state(ws, state)
-    assert slots.read_state(ws) is None  # path missing → stale
+
+    loaded = slots.read_state(ws)
+    assert loaded is not None
+    assert loaded.canonical is None  # stale → cleared
+    assert "worktree-1" in loaded.slots
+    assert loaded.slots["worktree-1"].feature == "warm-feat"
+    assert loaded.previous_canonical == "prev"
+    assert loaded.last_touched["warm-feat"] == "2026-05-26T14:00:00Z"
+    assert loaded.last_touched["x"] == "2026-05-28T10:00:00Z"
+
+
+def test_read_returns_none_when_json_broken(canopy_toml):
+    """Catastrophically broken state file → return None."""
+    ws = Workspace(load_config(canopy_toml))
+    path = canopy_toml / ".canopy" / "state" / "slots.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not valid json")
+    assert slots.read_state(ws) is None
+
+
+def test_in_flight_roundtrips_through_write_read(canopy_toml):
+    """in_flight field round-trips through to_dict/from_json."""
+    ws = Workspace(load_config(canopy_toml))
+    state = slots.SlotState(
+        slot_count=2,
+        in_flight={
+            "feature_being_promoted": "Y",
+            "previously_canonical": "X",
+            "started_at": "2026-05-28T10:00:00Z",
+            "per_repo_completed": [
+                {"repo": "repo-a", "status": "fastpath_swapped",
+                 "slot_id": "worktree-1"},
+            ],
+            "failed_repo": "repo-b",
+            "error_what": "git checkout failed",
+        },
+    )
+    slots.write_state(ws, state)
+    loaded = slots.read_state(ws)
+    assert loaded is not None
+    assert loaded.in_flight is not None
+    assert loaded.in_flight["feature_being_promoted"] == "Y"
+    assert loaded.in_flight["failed_repo"] == "repo-b"
+    assert loaded.in_flight["per_repo_completed"][0]["repo"] == "repo-a"
 
 
 def test_slot_worktree_path(canopy_toml):
