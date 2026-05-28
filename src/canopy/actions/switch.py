@@ -27,8 +27,8 @@ from typing import Any
 
 from ..git import repo as git
 from ..workspace.workspace import Workspace
-from . import active_feature as af
 from . import evacuate as evac
+from . import slots as slots_mod
 from . import switch_preflight as preflight
 from .aliases import resolve_feature, repos_for_feature
 from .errors import BlockerError, FixAction
@@ -59,11 +59,8 @@ def switch(
     Returns ``{feature, mode, per_repo_paths, previously_canonical?,
     evacuation?, eviction?, branches_created?, migration?}``.
     """
+    _ensure_post_migration(workspace)
     feature_name = resolve_feature_safely(workspace, feature)
-
-    # Lazy migration — populate last_touched/active state on first switch
-    # in a workspace that was on canopy < 2.9.
-    migration_info = _maybe_migrate(workspace)
 
     repo_branches = repos_for_feature(workspace, feature_name)
     if not repo_branches:
@@ -77,8 +74,6 @@ def switch(
     )
 
     out: dict[str, Any] = {"feature": feature_name}
-    if migration_info:
-        out["migration"] = migration_info
     previously_canonical = pre["previously_canonical"]
     if previously_canonical:
         out["previously_canonical"] = previously_canonical
@@ -178,42 +173,14 @@ def _do_repo_switch(
         })
         return
 
-    # If Y is currently warm in this repo, the warm worktree is holding
-    # the branch — must remove it before main can check out Y.
-    if evac.has_warm_worktree(workspace, feature_name, repo_name):
-        wt_path = evac.warm_worktree_path(workspace, feature_name, repo_name)
-        if git.is_dirty(wt_path):
-            raise BlockerError(
-                code="warm_worktree_dirty_on_promote",
-                what=(
-                    f"warm worktree {wt_path} has uncommitted changes;"
-                    f" can't promote {feature_name} to canonical without"
-                    f" losing them"
-                ),
-                details={"feature": feature_name, "repo": repo_name,
-                         "worktree_path": str(wt_path)},
-                fix_actions=[
-                    FixAction(
-                        action="commit",
-                        args={"feature": feature_name},
-                        safe=False,
-                        preview=f"commit dirty changes in {wt_path}",
-                    ),
-                    FixAction(
-                        action="stash_save_feature",
-                        args={"feature": feature_name},
-                        safe=True,
-                        preview=f"stash dirty changes in {wt_path}",
-                    ),
-                ],
-            )
-        git.worktree_remove(repo_path, wt_path)
-
     # Mode A: wind-down — stash X dirty into a feature-tagged stash on
     # X's branch, then plain checkout Y in main. No worktree-add for X.
     if release_current and previously_canonical and current == _branch_for_in_repo(
         workspace, previously_canonical, repo_name,
     ):
+        # If Y is warm in a slot, must free it from the slot before main
+        # can adopt it (git one-checkout-per-branch rule).
+        _free_warm_slot_if_holding(workspace, feature_name, repo_name)
         stash_ref = _stash_for_winddown(
             workspace, previously_canonical, repo_path,
         )
@@ -229,7 +196,7 @@ def _do_repo_switch(
         })
         return
 
-    # Mode B: active rotation — evacuate X to warm if main is on X.
+    # Mode B: active rotation
     if (
         previously_canonical
         and not release_current
@@ -237,15 +204,53 @@ def _do_repo_switch(
             workspace, previously_canonical, repo_name,
         )
     ):
+        # Fast-path: Y is already warm in some slot → 5-op swap
+        y_slot = slots_mod.slot_for_feature(workspace, feature_name)
+        if y_slot is not None:
+            slot_dir = slots_mod.slot_worktree_path(
+                workspace, y_slot, repo_name,
+            )
+            if (slot_dir / ".git").exists():
+                default_branch = workspace.get_repo(
+                    repo_name,
+                ).config.default_branch
+                result = evac.fastpath_swap_repo(
+                    workspace,
+                    x_feature=previously_canonical,
+                    y_feature=target_branch,
+                    repo_name=repo_name,
+                    repo_path=repo_path,
+                    slot_id=y_slot,
+                    default_branch=default_branch,
+                )
+                per_repo_results.append(result)
+                return
+            # Fall through: Y's slot entry exists but this repo's slot
+            # dir is missing (partial-scope drift). Treat as cold-Y.
+
+        # Cold-Y path: allocate a fresh slot for X
+        state = slots_mod.read_state(workspace) or slots_mod.SlotState(
+            slot_count=workspace.config.slots,
+        )
+        x_slot = slots_mod.allocate_slot(state)
+        if x_slot is None:
+            # Preflight should have caught this; defensive
+            raise BlockerError(
+                code="no_free_slot",
+                what="no free slot for evacuation (preflight should have raised)",
+            )
         result = evac.evacuate_repo(
             workspace, previously_canonical, repo_name, repo_path,
+            slot_id=x_slot,
             target_branch=target_branch,
         )
         per_repo_results.append(result)
         return
 
     # Fallback: main is on something else (or not on previous_canonical).
-    # Just stash + checkout.
+    # Just stash + checkout. If Y happens to be warm somewhere, free it
+    # first.
+    _free_warm_slot_if_holding(workspace, feature_name, repo_name)
     if git.is_dirty(repo_path):
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         current_label = current or "(detached)"
@@ -351,24 +356,55 @@ def _post_switch_persist(
     release_current: bool,
     per_repo_results: list[dict[str, Any]],
 ) -> None:
-    """Finalize the switch result: write active_feature.json + populate
-    summary fields. Mutates ``out`` in place."""
+    """Finalize the switch result: write ``slots.json`` + populate summary
+    fields. Mutates ``out`` in place."""
     out["mode"] = "wind_down" if release_current else "active_rotation"
     out["per_repo"] = per_repo_results
     out["per_repo_paths"] = new_canonical_paths
 
-    # last_touched bumps both Y (now) and the previously-canonical X
-    # (so its warm slot has fresh recency for future LRU picks).
-    touched: list[str] = []
-    if previously_canonical:
-        touched.append(previously_canonical)
-    entry = af.write_active(
-        workspace, feature_name, new_canonical_paths,
-        touched_features=touched,
+    state = slots_mod.read_state(workspace) or slots_mod.SlotState(
+        slot_count=workspace.config.slots,
     )
-    out["activated_at"] = entry.activated_at
-    if entry.previous_feature:
-        out["previous_feature_in_state"] = entry.previous_feature
+    now = slots_mod.now_iso()
+
+    state.previous_canonical = (
+        state.canonical.feature if state.canonical else None
+    )
+    state.canonical = slots_mod.CanonicalEntry(
+        feature=feature_name,
+        activated_at=now,
+        per_repo_paths={k: str(v) for k, v in new_canonical_paths.items()},
+    )
+
+    # Apply per-repo slot mutations. fastpath swaps update the existing
+    # slot entry; cold-Y evacuations occupy a freshly allocated slot.
+    for r in per_repo_results:
+        if r.get("status") == "fastpath_swapped":
+            sid = r["slot_id"]
+            state.slots[sid] = slots_mod.SlotEntry(
+                feature=r["swapped_out"], occupied_at=now,
+            )
+        elif r.get("status") == "evacuated":
+            sid = r["slot_id"]
+            state.slots[sid] = slots_mod.SlotEntry(
+                feature=previously_canonical or "",
+                occupied_at=now,
+            )
+
+    state.last_touched[feature_name] = now
+    if previously_canonical:
+        state.last_touched[previously_canonical] = now
+
+    # Drop any slot entries that still claim Y — Y is now canonical and
+    # its slot dir (if it had one) was emptied by fastpath_swap_repo.
+    for sid, entry in list(state.slots.items()):
+        if entry.feature == feature_name:
+            del state.slots[sid]
+
+    slots_mod.write_state(workspace, state)
+    out["activated_at"] = now
+    if state.previous_canonical:
+        out["previous_feature_in_state"] = state.previous_canonical
 
 
 def resolve_feature_safely(workspace: Workspace, feature: str) -> str:
@@ -390,17 +426,21 @@ def _evict_warm_to_cold(
 ) -> dict[str, Any]:
     """Park a warm feature back to cold. Auto-stash any dirty work first.
 
-    For each repo whose warm worktree exists for this feature:
-      1. If the worktree is dirty, stash with feature tag.
-      2. ``git worktree remove`` the worktree dir.
-      3. The branch stays — feature is now cold.
+    Slot-aware: finds the slot currently holding ``feature`` and clears
+    every repo subdir of that slot. The branch stays — feature is now
+    cold. After clearing, removes the slot entry from ``slots.json``.
 
-    Returns ``{feature, repos: [{repo, stashed, stash_ref?, removed}]}``.
+    Returns ``{feature, slot_id, repos: [{repo, stashed, stash_ref?,
+    removed}]}``. Empty repos list if the feature wasn't actually warm.
     """
+    slot_id = slots_mod.slot_for_feature(workspace, feature)
+    if slot_id is None:
+        return {"feature": feature, "slot_id": None, "repos": []}
+
     repo_results: list[dict[str, Any]] = []
     for state in workspace.repos:
         repo_name = state.config.name
-        wt_path = evac.warm_worktree_path(workspace, feature, repo_name)
+        wt_path = slots_mod.slot_worktree_path(workspace, slot_id, repo_name)
         if not (wt_path.exists() and (wt_path / ".git").exists()):
             continue
         stash_ref: str | None = None
@@ -419,7 +459,57 @@ def _evict_warm_to_cold(
             "stash_ref": stash_ref,
             "removed": True,
         })
-    return {"feature": feature, "repos": repo_results}
+
+    # Drop the slot entry from state so the slot becomes available.
+    st = slots_mod.read_state(workspace)
+    if st is not None and slot_id in st.slots:
+        del st.slots[slot_id]
+        slots_mod.write_state(workspace, st)
+    return {"feature": feature, "slot_id": slot_id, "repos": repo_results}
+
+
+def _free_warm_slot_if_holding(
+    workspace: Workspace, feature: str, repo_name: str,
+) -> None:
+    """If ``feature`` is warm in some slot for ``repo_name``, remove that
+    slot's worktree for this repo so main can adopt the branch.
+
+    Raises ``BlockerError(warm_worktree_dirty_on_promote)`` if the slot
+    is dirty — losing the user's work is never silent. Mirrors the
+    pre-3.0 reverse-evacuation safety check, just keyed by slot id.
+    """
+    slot_id = slots_mod.slot_for_feature(workspace, feature)
+    if slot_id is None:
+        return
+    wt_path = slots_mod.slot_worktree_path(workspace, slot_id, repo_name)
+    if not (wt_path / ".git").exists():
+        return
+    if git.is_dirty(wt_path):
+        raise BlockerError(
+            code="warm_worktree_dirty_on_promote",
+            what=(
+                f"warm worktree {wt_path} has uncommitted changes;"
+                f" can't promote {feature} to canonical without losing them"
+            ),
+            details={"feature": feature, "repo": repo_name,
+                     "worktree_path": str(wt_path), "slot_id": slot_id},
+            fix_actions=[
+                FixAction(
+                    action="commit",
+                    args={"feature": feature},
+                    safe=False,
+                    preview=f"commit dirty changes in {wt_path}",
+                ),
+                FixAction(
+                    action="stash_save_feature",
+                    args={"feature": feature},
+                    safe=True,
+                    preview=f"stash dirty changes in {wt_path}",
+                ),
+            ],
+        )
+    repo_state = workspace.get_repo(repo_name)
+    git.worktree_remove(repo_state.abs_path, wt_path)
 
 
 # ── wind-down stash helper ──────────────────────────────────────────────
@@ -484,71 +574,28 @@ def _create_missing_branches(
     return out
 
 
-# ── lazy 2.9 migration ──────────────────────────────────────────────────
+# ── pre-3.0 migration gate ──────────────────────────────────────────────
 
-def _maybe_migrate(workspace: Workspace) -> dict[str, Any] | None:
-    """First-touch migration for pre-2.9 workspaces.
+def _ensure_post_migration(workspace: Workspace) -> None:
+    """Refuse to switch on a workspace still on the pre-3.0 layout.
 
-    Detection: ``active_feature.json`` is missing OR the existing entry
-    has no ``last_touched`` field (older schema). When detected, populate
-    state from current filesystem reality WITHOUT forcing eviction —
-    everything not currently canonical is left wherever it lives (warm
-    if a worktree exists, cold otherwise). Returns a small report dict
-    if migration ran, None otherwise.
+    If ``.canopy/state/active_feature.json`` exists, the workspace hasn't
+    been migrated to the slot model yet. Surface a structured blocker
+    pointing at ``canopy migrate-slots`` instead of silently writing the
+    new ``slots.json`` alongside (which would leave two sources of truth).
     """
-    current = af.read_active(workspace)
-    if current is not None and current.last_touched:
-        return None  # already on 2.9 schema
-
-    # Identify the canonical feature: the branch currently checked out
-    # in the main checkout of the first canopy-managed repo, IF any
-    # known feature lane matches.
-    from ..features.coordinator import FeatureCoordinator
-    coord = FeatureCoordinator(workspace)
-    try:
-        lanes = coord.list_active()
-    except Exception:
-        lanes = []
-    lane_names = {lane.name for lane in lanes}
-
-    canonical: str | None = None
-    if workspace.repos:
-        try:
-            head_branch = git.current_branch(workspace.repos[0].abs_path)
-            if head_branch in lane_names:
-                canonical = head_branch
-        except git.GitError:
-            pass
-
-    # Initial last_touched: bump every active lane to lane.created_at if
-    # available; canonical (if any) gets now.
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    last_touched: dict[str, str] = {}
-    for lane in lanes:
-        ts = lane.created_at or now
-        last_touched[lane.name] = ts
-    if canonical:
-        last_touched[canonical] = now
-
-    if canonical:
-        per_repo_paths = {
-            r.config.name: str(r.abs_path.resolve()) for r in workspace.repos
-        }
-        af.write_active(
-            workspace, canonical, per_repo_paths,
-            touched_features=list(last_touched.keys()),
+    old = workspace.config.root / ".canopy/state/active_feature.json"
+    if old.exists():
+        raise BlockerError(
+            code="pre_migration",
+            what="this workspace is on the pre-3.0 layout — run `canopy migrate-slots`",
+            details={"old_state_file": str(old)},
+            fix_actions=[
+                FixAction(
+                    action="migrate_slots",
+                    args={},
+                    safe=True,
+                    preview="canopy migrate-slots — one-shot rewrite to slot layout",
+                ),
+            ],
         )
-        return {
-            "ran": True, "canonical_detected": canonical,
-            "lanes_indexed": sorted(lane_names),
-        }
-
-    # No canonical detected — initialize empty active state but with the
-    # last_touched map seeded so the next real switch has LRU data.
-    if last_touched and current is None:
-        # Write a placeholder entry where feature is empty? No — write_active
-        # requires a feature. Just record the seed in a synthetic state so
-        # future switches benefit.
-        # For PR1, skip this case — first real switch will populate it.
-        pass
-    return {"ran": True, "canonical_detected": None, "lanes_indexed": sorted(lane_names)}

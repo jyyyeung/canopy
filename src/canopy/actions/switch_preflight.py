@@ -24,21 +24,18 @@ from typing import Any
 
 from ..git import repo as git
 from ..workspace.workspace import Workspace
-from . import active_feature as af
+from . import slots as slots_mod
 from .errors import BlockerError, FixAction
-from .evacuate import warm_features, warm_worktree_path
 
 
-# Default cap when max_worktrees is unset (0 = legacy unlimited for the
-# explicit worktree_create path; switch's canonical-slot logic interprets
-# 0 as the new default of 2 for warm-slot management). See
-# docs/concepts.md §4.
+# Default cap when slots is unset. The config parser already defaults
+# `slots` to 2, so this is purely defensive.
 DEFAULT_WARM_SLOT_CAP = 2
 
 
 def warm_slot_cap(workspace: Workspace) -> int:
     """Return the warm-slot cap honored by switch's canonical-slot logic."""
-    raw = workspace.config.max_worktrees
+    raw = workspace.config.slots
     return raw if raw and raw > 0 else DEFAULT_WARM_SLOT_CAP
 
 
@@ -96,38 +93,29 @@ def preflight(
         if not git.branch_exists(repo_path, branch):
             branches_to_create.append((repo_name, branch))
 
-    # Warm-worktree leftover check for the previously-canonical feature
-    # (only applies in active-rotation mode where we'd add a new worktree).
-    current = af.read_active(workspace)
-    previously_canonical = current.feature if current and current.feature != feature_to_activate else None
+    # Read the slot state (3.0 layout). previously_canonical is the
+    # canonical feature, if any, that differs from Y.
+    state = slots_mod.read_state(workspace)
+    previously_canonical: str | None = None
+    if state and state.canonical and state.canonical.feature != feature_to_activate:
+        previously_canonical = state.canonical.feature
 
-    if previously_canonical and not release_current:
-        for repo_name in repo_branches:
-            dest = warm_worktree_path(workspace, previously_canonical, repo_name)
-            if dest.exists():
-                issues.append({
-                    "repo": repo_name,
-                    "kind": "warm_worktree_path_occupied",
-                    "what": (
-                        f"warm worktree path already exists for"
-                        f" {previously_canonical}/{repo_name}: {dest}"
-                    ),
-                    "path": str(dest),
-                })
+    already_warm: set[str] = (
+        {e.feature for e in state.slots.values()} if state else set()
+    )
 
     # Cap-will-fire check (only active-rotation mode evacuates X to warm)
     cap_will_fire = False
     lru_eviction_candidate: str | None = None
     if previously_canonical and not release_current:
         cap = warm_slot_cap(workspace)
-        already_warm = set(warm_features(workspace))
         # Y is becoming canonical, so if Y was warm it leaves the warm set;
         # X (previously_canonical) is joining the warm set.
         post_switch_warm = (already_warm - {feature_to_activate}) | {previously_canonical}
         if len(post_switch_warm) > cap:
             cap_will_fire = True
             lru_eviction_candidate = _pick_lru(
-                current, candidates=post_switch_warm - {previously_canonical},
+                state, candidates=post_switch_warm - {previously_canonical},
             )
             if no_evict or lru_eviction_candidate is None:
                 issues.append({
@@ -175,7 +163,7 @@ def preflight(
                     ),
                     FixAction(
                         action="workspace_config",
-                        args={"max_worktrees": cap_issue["cap"] + 1},
+                        args={"slots": cap_issue["cap"] + 1},
                         safe=True,
                         preview=f"raise warm_slot_cap to {cap_issue['cap'] + 1}",
                     ),
@@ -198,20 +186,20 @@ def preflight(
 
 
 def _pick_lru(
-    active: af.ActiveFeature | None,
+    state: slots_mod.SlotState | None,
     *,
     candidates: set[str],
 ) -> str | None:
     """Pick the least-recently-touched feature from ``candidates``.
 
-    Reads ``active.last_touched``. Features not in the map are considered
+    Reads ``state.last_touched``. Features not in the map are considered
     older than any feature with a recorded timestamp (lexicographically
     sorted as a tiebreaker for determinism).
     """
     if not candidates:
         return None
-    if active is None or not active.last_touched:
+    if state is None or not state.last_touched:
         # No recency info — fall back to lexicographic order for determinism
         return sorted(candidates)[0]
     # Sort by (timestamp_or_empty, name)
-    return sorted(candidates, key=lambda f: (active.last_touched.get(f, ""), f))[0]
+    return sorted(candidates, key=lambda f: (state.last_touched.get(f, ""), f))[0]
