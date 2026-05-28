@@ -1585,22 +1585,29 @@ def sync(strategy: str = "rebase") -> dict:
 
 
 @mcp.tool()
-def slots() -> dict:
-    """List canonical + warm slot occupancy from slots.json.
+def slots(rich: bool = True) -> dict:
+    """Slot occupancy + (default) per-slot enrichment for the dashboard / agent.
 
-    Returns the structured slot state: canonical feature (with per-repo
-    paths), warm slot occupancy keyed by slot id (worktree-1, worktree-2,
-    ...), and the last_touched LRU map. Returns {canonical: None, slots: {}}
-    when no slot state has been written yet.
+    With ``rich=True`` (default for MCP — what the dashboard and the agent
+    both want), returns the full payload: per-repo branch, dirty + counts,
+    ahead/behind, default branch, last commit, PR + CI rollup, unresolved
+    bot threads, linear link, and the computed ``feature_state`` — for
+    every occupied slot AND canonical. Empty slots are explicit ``null``.
 
-    Use this to answer "what's in each slot" without inspecting filesystem
-    paths directly. The slot ids returned here are stable and can be passed
-    as feature aliases to any tool that accepts a feature name (added in T14).
+    With ``rich=False``, returns the lightweight shape from slots.json
+    only (slot id → feature + last_touched). Use for cheap polling when
+    the caller doesn't need PR/CI/bot data.
+
+    Slot ids returned here are stable and can be passed as feature
+    aliases to any tool that accepts one (added in T14).
     """
     from ..actions import slots as slots_mod
     workspace = _get_workspace()
-    state = slots_mod.read_state(workspace)
-    return state.to_dict() if state else {"canonical": None, "slots": {}}
+    if not rich:
+        state = slots_mod.read_state(workspace)
+        return state.to_dict() if state else {"canonical": None, "slots": {}}
+    from ..actions.slot_details import rich_slots
+    return rich_slots(workspace)
 
 
 @mcp.tool()

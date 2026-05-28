@@ -900,14 +900,20 @@ def cmd_worktree_list(args: argparse.Namespace) -> None:
 
 
 def cmd_slots(args: argparse.Namespace) -> None:
-    """Show slot occupancy: canonical + warm slots + last_touched."""
+    """Show slot occupancy: canonical + warm slots + last_touched.
+
+    ``--json`` always returns the rich shape (single call powers the
+    dashboard + agent); pretty terminal output stays compact unless
+    ``--rich`` is passed.
+    """
     from ..actions import slots as slots_mod
     from .ui import console
 
     workspace = _load_workspace()
     state = slots_mod.read_state(workspace)
     if args.json:
-        _print_json(state.to_dict() if state else {"canonical": None, "slots": {}})
+        from ..actions.slot_details import rich_slots
+        _print_json(rich_slots(workspace))
         return
     if state is None:
         console.print()
@@ -3397,7 +3403,9 @@ def main() -> None:
         "slots",
         help="Show slot occupancy: canonical + warm slots + last_touched LRU",
     )
-    slots_p.add_argument("--json", action="store_true", help="Output as JSON")
+    slots_p.add_argument("--json", action="store_true", help="Output as JSON (always rich)")
+    slots_p.add_argument("--rich", action="store_true",
+                          help="Include per-slot PR/CI/bots/linear (implied by --json)")
 
     # migrate-slots
     migrate_slots_p = subparsers.add_parser(

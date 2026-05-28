@@ -379,3 +379,18 @@ def test_slots_command_json(workspace_with_slots, capsys, monkeypatch):
     data = _json.loads(capsys.readouterr().out)
     assert data["canonical"]["feature"] == "X"
     assert "worktree-1" in data["slots"]
+
+
+def test_slots_command_json_is_rich(workspace_with_slots, capsys, monkeypatch):
+    """`--json` always returns the rich shape (single call for dashboard + agent)."""
+    monkeypatch.chdir(workspace_with_slots.config.root)
+    from canopy.cli.main import cmd_slots
+    args = argparse.Namespace(json=True)
+    cmd_slots(args)
+    data = _json.loads(capsys.readouterr().out)
+    # rich-only keys
+    assert data["canonical"]["slot_id"] == "canonical"
+    assert "repos" in data["canonical"]
+    assert "feature_state" in data["canonical"]
+    # empty slot is explicit null (never {})
+    assert data["slots"]["worktree-2"] is None
