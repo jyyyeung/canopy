@@ -279,6 +279,20 @@ def slot_load(
 
 
 @mcp.tool()
+def slot_clear(slot_id: str) -> dict:
+    """Evict the occupant of a slot to cold (with feature-tagged stash if dirty)."""
+    from ..actions.slot_load import slot_clear as _impl
+    return _impl(_get_workspace(), slot_id)
+
+
+@mcp.tool()
+def slot_swap(slot_a: str, slot_b: str) -> dict:
+    """Exchange the occupants of two slots. Requires identical repo scope on both features."""
+    from ..actions.slot_load import slot_swap as _impl
+    return _impl(_get_workspace(), slot_a, slot_b)
+
+
+@mcp.tool()
 def commit(message: str = "", feature: str | None = None,
            repos: list[str] | None = None, paths: list[str] | None = None,
            no_hooks: bool = False, amend: bool = False,

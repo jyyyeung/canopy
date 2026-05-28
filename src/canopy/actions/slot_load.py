@@ -160,11 +160,11 @@ def slot_load(
 
 
 def slot_clear(workspace: Workspace, slot_id: str) -> dict[str, Any]:
-    """Evict a feature from a slot to cold (T17 stub — minimal for T16 eviction).
+    """Evict a feature from a slot to cold.
 
-    Removes the worktrees for all repos the feature touches, then
-    removes the slot entry from slots.json. The branch is kept; this
-    operation only removes the warm worktree.
+    Creates a feature-tagged stash for any dirty work before removing the
+    worktree (best-effort — stash failure does not block removal). The branch
+    is kept; only the warm worktree is removed.
     """
     state = slots_mod.read_state(workspace)
     if state is None or slot_id not in state.slots:
@@ -183,9 +183,26 @@ def slot_clear(workspace: Workspace, slot_id: str) -> dict[str, Any]:
         except KeyError:
             continue
         slot_path = slots_mod.slot_worktree_path(workspace, slot_id, repo_name)
-        if slot_path.exists():
+        if not slot_path.exists():
+            cleared.append({"repo": repo_name, "status": "missing", "slot_path": str(slot_path)})
+            continue
+        # Tag any dirty work with a feature-tagged stash before removing the worktree.
+        stash_ref = None
+        try:
+            from . import evacuate as evac
+            stash_ref = evac.stash_for_evacuation(workspace, feature, repo_name, slot_path)
+        except Exception:
+            stash_ref = None  # best-effort; proceed with remove
+        try:
             git.worktree_remove(repo.abs_path, slot_path, force=True)
-        cleared.append({"repo": repo_name, "slot_path": str(slot_path)})
+        except Exception as e:
+            cleared.append({"repo": repo_name, "status": "remove_failed",
+                             "slot_path": str(slot_path), "error": str(e)})
+            continue
+        cleared.append({
+            "repo": repo_name, "status": "cleared",
+            "slot_path": str(slot_path), "stash_ref": stash_ref,
+        })
     # Re-read to get latest state, then remove slot entry.
     state = slots_mod.read_state(workspace) or state
     if slot_id in state.slots:
@@ -195,5 +212,70 @@ def slot_clear(workspace: Workspace, slot_id: str) -> dict[str, Any]:
 
 
 def slot_swap(workspace: Workspace, slot_a: str, slot_b: str) -> dict[str, Any]:
-    """Swap features between two slots (T17 stub — full implementation in T17)."""
-    raise NotImplementedError("slot_swap lands in T17")
+    """Exchange the occupants of two slots.
+
+    Performs two parallel branch checkouts inside the slot worktrees and
+    updates slots.json — no worktree_add or worktree_remove involved.
+    Raises swap_scope_mismatch when the two features touch different repo sets.
+    """
+    state = slots_mod.read_state(workspace)
+    if state is None:
+        raise BlockerError(code="no_slot_state", what="no slots.json")
+    if slot_a not in state.slots:
+        raise BlockerError(code="empty_slot",
+                           what=f"slot '{slot_a}' is empty — cannot swap")
+    if slot_b not in state.slots:
+        raise BlockerError(code="empty_slot",
+                           what=f"slot '{slot_b}' is empty — cannot swap")
+
+    feat_a = state.slots[slot_a].feature
+    feat_b = state.slots[slot_b].feature
+
+    branches_a = repos_for_feature(workspace, feat_a) or {}
+    branches_b = repos_for_feature(workspace, feat_b) or {}
+
+    # v1 swap requires identical repo scope on both features.
+    if set(branches_a.keys()) != set(branches_b.keys()):
+        raise BlockerError(
+            code="swap_scope_mismatch",
+            what=(f"features '{feat_a}' and '{feat_b}' touch different repo sets — "
+                  "v1 swap requires identical scope"),
+            details={
+                "feat_a": feat_a, "feat_a_repos": sorted(branches_a.keys()),
+                "feat_b": feat_b, "feat_b_repos": sorted(branches_b.keys()),
+            },
+        )
+
+    # Per repo, swap the checked-out branches inside each slot's worktree.
+    # Git won't allow a branch to be checked out in two worktrees simultaneously,
+    # so we detach both slots first to free the branch locks, then do the checkouts.
+    per_repo: list[dict] = []
+    repo_names = sorted(branches_a.keys())
+    for repo_name in repo_names:
+        slot_a_path = slots_mod.slot_worktree_path(workspace, slot_a, repo_name)
+        slot_b_path = slots_mod.slot_worktree_path(workspace, slot_b, repo_name)
+        git.checkout_detach(slot_a_path)
+        git.checkout_detach(slot_b_path)
+    for repo_name in repo_names:
+        slot_a_path = slots_mod.slot_worktree_path(workspace, slot_a, repo_name)
+        slot_b_path = slots_mod.slot_worktree_path(workspace, slot_b, repo_name)
+        # slot A's worktree adopts feat_b's branch; slot B's worktree adopts feat_a's branch.
+        git.checkout(slot_a_path, branches_b[repo_name])
+        git.checkout(slot_b_path, branches_a[repo_name])
+        per_repo.append({"repo": repo_name,
+                          "slot_a_now": branches_b[repo_name],
+                          "slot_b_now": branches_a[repo_name]})
+
+    now = slots_mod.now_iso()
+    state = slots_mod.read_state(workspace) or state
+    state.slots[slot_a] = slots_mod.SlotEntry(feature=feat_b, occupied_at=now)
+    state.slots[slot_b] = slots_mod.SlotEntry(feature=feat_a, occupied_at=now)
+    state.last_touched[feat_a] = now
+    state.last_touched[feat_b] = now
+    slots_mod.write_state(workspace, state)
+
+    return {
+        "swapped": [f"{feat_a}↔{feat_b}"],
+        "slot_a": slot_a, "slot_b": slot_b,
+        "per_repo": per_repo,
+    }

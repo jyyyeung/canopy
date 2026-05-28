@@ -226,6 +226,11 @@ def checkout(repo_path: Path, branch: str) -> None:
     _run(["checkout", branch], cwd=repo_path)
 
 
+def checkout_detach(repo_path: Path) -> None:
+    """Detach HEAD so the current branch lock is released (used before slot swap)."""
+    _run(["checkout", "--detach"], cwd=repo_path)
+
+
 def stage_files(repo_path: Path, files: list[str]) -> None:
     """Stage specific files."""
     if files:

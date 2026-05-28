@@ -955,6 +955,32 @@ def cmd_slot_load(args: argparse.Namespace) -> None:
         console.print(f"  Evicted: [muted]{result['evicted']['feature']}[/]")
 
 
+def cmd_slot_clear(args: argparse.Namespace) -> None:
+    """Evict a slot's occupant to cold."""
+    from ..actions.slot_load import slot_clear
+    from .ui import console
+
+    workspace = _load_workspace()
+    result = slot_clear(workspace, args.slot_id)
+    if args.json:
+        _print_json(result)
+        return
+    console.print(f"[ok]Cleared[/] {result['slot_id']}: evicted [info]{result['feature']}[/]")
+
+
+def cmd_slot_swap(args: argparse.Namespace) -> None:
+    """Exchange occupants of two slots."""
+    from ..actions.slot_load import slot_swap
+    from .ui import console
+
+    workspace = _load_workspace()
+    result = slot_swap(workspace, args.slot_a, args.slot_b)
+    if args.json:
+        _print_json(result)
+        return
+    console.print(f"[ok]Swapped:[/] {result['swapped'][0]} ({result['slot_a']} ↔ {result['slot_b']})")
+
+
 def cmd_migrate_slots(args: argparse.Namespace) -> None:
     """One-shot migration from pre-3.0 layout to 3.0 slot model."""
     from ..actions.migrate_slots import migrate, AlreadyMigratedError, NotLegacyError
@@ -3438,6 +3464,15 @@ def main() -> None:
                               help="Run env/install bootstrap after load")
     slot_load_p.add_argument("--json", action="store_true")
 
+    slot_clear_p = slot_sub.add_parser("clear", help="Evict a slot's occupant to cold")
+    slot_clear_p.add_argument("slot_id")
+    slot_clear_p.add_argument("--json", action="store_true")
+
+    slot_swap_p = slot_sub.add_parser("swap", help="Exchange occupants of two slots")
+    slot_swap_p.add_argument("slot_a")
+    slot_swap_p.add_argument("slot_b")
+    slot_swap_p.add_argument("--json", action="store_true")
+
     # migrate-slots
     migrate_slots_p = subparsers.add_parser(
         "migrate-slots",
@@ -3735,6 +3770,8 @@ def main() -> None:
     elif args.command == "slot":
         slot_commands = {
             "load": cmd_slot_load,
+            "clear": cmd_slot_clear,
+            "swap": cmd_slot_swap,
         }
         slot_commands[args.slot_cmd](args)
     elif args.command in commands:

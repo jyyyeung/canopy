@@ -1,4 +1,4 @@
-"""Tests for actions/slot_load.py — slot_load primitive (T16)."""
+"""Tests for actions/slot_load.py — slot_load + slot_clear + slot_swap (T16, T17)."""
 import subprocess
 
 import pytest
@@ -34,6 +34,32 @@ def test_slot_load_refuses_when_already_warm(workspace_with_slots):
     with pytest.raises(BlockerError) as e:
         slot_load(workspace_with_slots, "Y", slot_id="worktree-2")
     assert e.value.code == "feature_already_warm"
+
+
+def test_slot_clear_evicts_to_cold(workspace_with_slots):
+    """slot-1 has Y; clear → Y goes cold, slot-1 empty, stash present if dirty."""
+    from canopy.actions.slot_load import slot_clear
+    result = slot_clear(workspace_with_slots, "worktree-1")
+    assert result["feature"] == "Y"
+    from canopy.actions import slots as sm
+    state = sm.read_state(workspace_with_slots)
+    assert "worktree-1" not in state.slots
+
+
+def test_slot_swap_exchanges_occupants(workspace_with_two_warm):
+    """slot-1=B, slot-2=A (fixture) → swap → slot-1=A, slot-2=B."""
+    from canopy.actions.slot_load import slot_swap
+    from canopy.actions import slots as sm
+    # Capture pre-swap state
+    before = sm.read_state(workspace_with_two_warm)
+    feat_in_1 = before.slots["worktree-1"].feature
+    feat_in_2 = before.slots["worktree-2"].feature
+    result = slot_swap(workspace_with_two_warm, "worktree-1", "worktree-2")
+    state = sm.read_state(workspace_with_two_warm)
+    # After swap, the features inside each slot have swapped
+    assert state.slots["worktree-1"].feature == feat_in_2
+    assert state.slots["worktree-2"].feature == feat_in_1
+    assert result["swapped"] == [f"{feat_in_1}↔{feat_in_2}"]
 
 
 def test_slot_load_occupied_slot_replace(workspace_with_slots):
