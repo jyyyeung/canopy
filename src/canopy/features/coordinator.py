@@ -16,8 +16,11 @@ from ..workspace.workspace import Workspace
 from ..git import repo as git
 from ..git.multi import create_branch_all, cross_repo_diff, find_type_overlaps
 from ..providers import get_issue_provider
+from ..actions import slots as slots_mod
 
-# Default directory for worktrees, relative to workspace root
+# Default directory for worktrees, relative to workspace root. In Wave 3.0
+# this contains generic numbered slot dirs (worktree-1, worktree-2, ...)
+# whose feature occupancy is tracked in .canopy/state/slots.json.
 _WORKTREE_DIR = ".canopy/worktrees"
 
 
@@ -155,25 +158,36 @@ class FeatureCoordinator:
             raise ValueError(f"Unknown repos: {', '.join(sorted(unknown))}")
 
         worktree_paths: dict[str, str] = {}
+        allocated_slot: str | None = None
 
         if use_worktrees:
-            # Check worktree limit
-            limit = self.workspace.config.max_worktrees
-            if limit > 0:
-                current_count = self._count_active_worktrees()
-                if current_count >= limit:
-                    stale = self._find_stale_worktrees()
-                    raise WorktreeLimitError(
-                        f"Worktree limit reached ({current_count}/{limit}). "
-                        f"Clean up with `canopy done <feature>` or raise the "
-                        f"limit with `canopy config max_worktrees {limit + 1}`.",
-                        current=current_count,
-                        limit=limit,
-                        stale=stale,
-                    )
+            # Wave 3.0: allocate a slot from .canopy/state/slots.json.
+            # The config's ``slots`` field is the warm-slot cap (canonical
+            # is separate). If all slots are full, raise WorktreeLimitError
+            # so the CLI / MCP can surface a fix action.
+            limit = self.workspace.config.slots
+            slot_state = slots_mod.read_state(self.workspace) or slots_mod.SlotState(
+                slot_count=limit,
+            )
+            # Honor the canopy.toml cap even if state was persisted with a
+            # different slot_count earlier.
+            slot_state.slot_count = limit
+
+            allocated_slot = slots_mod.allocate_slot(slot_state)
+            if allocated_slot is None:
+                stale = self._find_stale_worktrees()
+                current = len(slot_state.slots)
+                raise WorktreeLimitError(
+                    f"Worktree limit reached ({current}/{limit}). "
+                    f"Clean up with `canopy done <feature>` or raise the "
+                    f"limit with `canopy config slots {limit + 1}`.",
+                    current=current,
+                    limit=limit,
+                    stale=stale,
+                )
 
             base = worktree_base or (self.workspace.config.root / _WORKTREE_DIR)
-            feature_dir = base / name
+            feature_dir = base / allocated_slot
             feature_dir.mkdir(parents=True, exist_ok=True)
 
             results: dict[str, bool | str] = {}
@@ -194,6 +208,14 @@ class FeatureCoordinator:
                 raise RuntimeError(
                     f"Failed to create worktrees in all repos: {failed}"
                 )
+
+            # Persist the slot occupancy + last_touched on success.
+            now = slots_mod.now_iso()
+            slot_state.slots[allocated_slot] = slots_mod.SlotEntry(
+                feature=name, occupied_at=now,
+            )
+            slot_state.last_touched[name] = now
+            slots_mod.write_state(self.workspace, slot_state)
         else:
             # Just create branches
             results = create_branch_all(self.workspace, name, target_repos)
@@ -223,6 +245,8 @@ class FeatureCoordinator:
         if worktree_paths:
             feature_data["worktree_paths"] = worktree_paths
             feature_data["use_worktrees"] = True
+        if allocated_slot:
+            feature_data["slot_id"] = allocated_slot
         if linear_issue:
             feature_data["linear_issue"] = linear_issue
             feature_data["linear_title"] = linear_title
@@ -471,7 +495,10 @@ class FeatureCoordinator:
         """Get the working directory path for each repo in a feature lane.
 
         For each repo, returns the best path to work in:
-        - If the branch is checked out in a worktree → that worktree path
+        - If the feature occupies a warm slot → the slot's repo subdir
+          (``.canopy/worktrees/worktree-N/<repo>``)
+        - If the branch is checked out in a worktree (legacy/ad-hoc) →
+          that worktree path
         - If the branch is the current branch in the repo → the repo path
         - Otherwise → the repo path (caller may need to checkout first)
 
@@ -481,6 +508,10 @@ class FeatureCoordinator:
         lane = self.status(name)
         paths: dict[str, str] = {}
 
+        # Wave 3.0: prefer the slot path when the feature is warm. This is
+        # the authoritative source for warm features.
+        slot_id = slots_mod.slot_for_feature(self.workspace, name)
+
         for repo_name in lane.repos:
             try:
                 state = self.workspace.get_repo(repo_name)
@@ -489,13 +520,21 @@ class FeatureCoordinator:
 
             repo_state = lane.repo_states.get(repo_name, {})
 
-            # Priority 1: worktree path
+            # Priority 1: slot path (Wave 3.0 canonical-slot model)
+            if slot_id is not None:
+                slot_path = slots_mod.slot_worktree_path(
+                    self.workspace, slot_id, repo_name,
+                )
+                if slot_path.exists():
+                    paths[repo_name] = str(slot_path)
+                    continue
+            # Priority 2: worktree path discovered by git (fallback)
             if repo_state.get("worktree_path"):
                 paths[repo_name] = repo_state["worktree_path"]
-            # Priority 2: repo is on this branch
+            # Priority 3: repo is on this branch
             elif state.current_branch == name:
                 paths[repo_name] = str(state.abs_path)
-            # Priority 3: branch exists but not checked out — use repo path
+            # Priority 4: branch exists but not checked out — use repo path
             elif repo_state.get("has_branch"):
                 paths[repo_name] = str(state.abs_path)
 
@@ -555,15 +594,16 @@ class FeatureCoordinator:
     def worktrees_live(self) -> dict:
         """Live scan of all worktrees across the workspace.
 
-        Scans .canopy/worktrees/ on disk and enriches each entry with
-        live git state (branch, dirty files, ahead/behind). Also includes
-        git-level worktree info per main repo. Never cached — always
-        reflects the filesystem as it is right now.
+        Wave 3.0: returns slot-keyed view of warm features. Iterates the
+        ``slots`` map from ``.canopy/state/slots.json`` (not feature-named
+        directories) and enriches each slot's repo subdirs with live git
+        state. Also includes git-level worktree info per main repo.
 
         Returns:
             {
-                "features": {
-                    "<feature>": {
+                "slots": {
+                    "worktree-1": {
+                        "feature": "<feature>",
                         "repos": {
                             "<repo>": {
                                 "path": str,
@@ -586,53 +626,51 @@ class FeatureCoordinator:
                 }
             }
         """
-        root = self.workspace.config.root
-        wt_base = root / _WORKTREE_DIR
-
-        # ── Part 1: scan .canopy/worktrees/ ──────────────────────────
-        features: dict = {}
-        if wt_base.is_dir():
-            for feat_dir in sorted(wt_base.iterdir()):
-                if not feat_dir.is_dir():
+        # ── Part 1: walk the slots map from slots.json ────────────────
+        slots: dict = {}
+        slot_state = slots_mod.read_state(self.workspace)
+        if slot_state is not None:
+            for slot_id, entry in sorted(slot_state.slots.items()):
+                feat_name = entry.feature
+                slot_dir = (
+                    self.workspace.config.root / _WORKTREE_DIR / slot_id
+                )
+                if not slot_dir.is_dir():
                     continue
-                feat_name = feat_dir.name
                 repos_info: dict = {}
-                for repo_dir in sorted(feat_dir.iterdir()):
+                for repo_dir in sorted(slot_dir.iterdir()):
                     if not repo_dir.is_dir():
                         continue
                     repo_name = repo_dir.name
-                    entry: dict = {"path": str(repo_dir)}
+                    repo_entry: dict = {"path": str(repo_dir)}
                     try:
-                        entry["branch"] = git.current_branch(repo_dir)
+                        repo_entry["branch"] = git.current_branch(repo_dir)
                         porcelain = git.status_porcelain(repo_dir)
-                        entry["dirty"] = len(porcelain) > 0
-                        entry["dirty_count"] = len(porcelain)
-                        entry["dirty_files"] = [
+                        repo_entry["dirty"] = len(porcelain) > 0
+                        repo_entry["dirty_count"] = len(porcelain)
+                        repo_entry["dirty_files"] = [
                             f.get("path", "") for f in porcelain
                         ]
-                        # Divergence from default branch
-                        # Find the matching repo config for default_branch
                         default_branch = "main"
                         try:
                             state = self.workspace.get_repo(repo_name)
                             default_branch = state.config.default_branch
                         except KeyError:
                             pass
-                        entry["default_branch"] = default_branch
+                        repo_entry["default_branch"] = default_branch
                         try:
                             ahead, behind = git.divergence(
-                                repo_dir, entry["branch"], default_branch,
+                                repo_dir, repo_entry["branch"], default_branch,
                             )
-                            entry["ahead"] = ahead
-                            entry["behind"] = behind
+                            repo_entry["ahead"] = ahead
+                            repo_entry["behind"] = behind
                         except git.GitError:
-                            entry["ahead"] = 0
-                            entry["behind"] = 0
+                            repo_entry["ahead"] = 0
+                            repo_entry["behind"] = 0
                     except git.GitError as e:
-                        entry["error"] = str(e)
-                    repos_info[repo_name] = entry
-                if repos_info:
-                    features[feat_name] = {"repos": repos_info}
+                        repo_entry["error"] = str(e)
+                    repos_info[repo_name] = repo_entry
+                slots[slot_id] = {"feature": feat_name, "repos": repos_info}
 
         # ── Part 2: git-level worktree info per main repo ────────────
         repos_wt: dict = {}
@@ -646,7 +684,7 @@ class FeatureCoordinator:
             }
 
         return {
-            "features": features,
+            "slots": slots,
             "repos": repos_wt,
         }
 
@@ -687,9 +725,16 @@ class FeatureCoordinator:
         worktrees_removed: dict[str, str] = {}
         branches_deleted: dict[str, str] = {}
 
-        # ── Step 1+2: Remove worktrees ──
-        wt_base = self.workspace.config.root / _WORKTREE_DIR / name
-        if wt_base.is_dir():
+        # ── Step 1+2: Remove worktrees from the feature's slot ──
+        # Wave 3.0: look up the slot in .canopy/state/slots.json. The
+        # worktree dir is .canopy/worktrees/<slot_id>/, not /<feature>/.
+        slot_id = slots_mod.slot_for_feature(self.workspace, name)
+        wt_base: Path | None = None
+        if slot_id is not None:
+            wt_base = (
+                self.workspace.config.root / _WORKTREE_DIR / slot_id
+            )
+        if wt_base is not None and wt_base.is_dir():
             for repo_dir in sorted(wt_base.iterdir()):
                 if not repo_dir.is_dir():
                     continue
@@ -701,7 +746,7 @@ class FeatureCoordinator:
                         porcelain = git.status_porcelain(repo_dir)
                         if porcelain:
                             raise ValueError(
-                                f"Worktree '{name}/{repo_name}' has uncommitted changes. "
+                                f"Worktree '{slot_id}/{repo_name}' has uncommitted changes. "
                                 f"Use --force to remove anyway."
                             )
                     except git.GitError:
@@ -721,11 +766,25 @@ class FeatureCoordinator:
                     except OSError:
                         worktrees_removed[repo_name] = f"error: {e}"
 
-            # Remove the feature directory if empty
+            # Remove the slot directory if empty
             try:
                 wt_base.rmdir()
             except OSError:
                 pass
+
+        # ── Step 2b: Drop the slot entry from slots.json ──
+        if slot_id is not None:
+            slot_state = slots_mod.read_state(self.workspace)
+            if slot_state is not None:
+                slot_state.slots.pop(slot_id, None)
+                # If canonical pointed at this feature (wind-down), clear it.
+                if (
+                    slot_state.canonical is not None
+                    and slot_state.canonical.feature == name
+                ):
+                    slot_state.canonical = None
+                slot_state.last_touched.pop(name, None)
+                slots_mod.write_state(self.workspace, slot_state)
 
         # ── Step 3: Delete local branches ──
         for repo_name in repos:
@@ -762,6 +821,7 @@ class FeatureCoordinator:
             # Remove worktree paths since they no longer exist
             features[name].pop("worktree_paths", None)
             features[name].pop("use_worktrees", None)
+            features[name].pop("slot_id", None)
             self._save_features(features)
             archived = True
 
@@ -1098,45 +1158,53 @@ class FeatureCoordinator:
         }
 
     def _count_active_worktrees(self) -> int:
-        """Count active worktree feature directories on disk."""
-        wt_base = self.workspace.config.root / _WORKTREE_DIR
-        if not wt_base.is_dir():
+        """Count occupied slots from slots.json."""
+        state = slots_mod.read_state(self.workspace)
+        if state is None:
             return 0
-        return sum(1 for d in wt_base.iterdir() if d.is_dir())
+        return len(state.slots)
 
     def _find_stale_worktrees(self) -> list[dict]:
-        """Find worktrees that are candidates for cleanup.
+        """Find slot-occupied features that are candidates for cleanup.
 
-        A worktree is 'stale' if:
-        - Its feature is marked as done/merged/abandoned in features.json
-        - All its repos are clean (no dirty files)
-        - Its branches have been merged into default
+        Wave 3.0: iterates the ``slots`` map in slots.json (not
+        feature-named directories). A slot is 'stale' if its feature is:
+        - Marked as done/merged/abandoned in features.json, OR
+        - All its repos are clean (no dirty files) and the branch has
+          been merged into default.
 
-        Returns a list of {name, reason} dicts, most stale first.
+        Returns a list of {name, slot_id, reason} dicts, most stale first.
         """
-        wt_base = self.workspace.config.root / _WORKTREE_DIR
-        if not wt_base.is_dir():
+        slot_state = slots_mod.read_state(self.workspace)
+        if slot_state is None or not slot_state.slots:
             return []
 
         features = self._load_features()
         stale = []
 
-        for feat_dir in sorted(wt_base.iterdir()):
-            if not feat_dir.is_dir():
-                continue
-            feat_name = feat_dir.name
+        for slot_id, entry in sorted(slot_state.slots.items()):
+            feat_name = entry.feature
             meta = features.get(feat_name, {})
+            slot_dir = (
+                self.workspace.config.root / _WORKTREE_DIR / slot_id
+            )
 
             # Check if archived
             status = meta.get("status", "active")
             if status in ("done", "merged", "abandoned"):
-                stale.append({"name": feat_name, "reason": f"status: {status}"})
+                stale.append({
+                    "name": feat_name, "slot_id": slot_id,
+                    "reason": f"status: {status}",
+                })
+                continue
+
+            if not slot_dir.is_dir():
                 continue
 
             # Check if all repos are clean and merged
             all_clean = True
             all_merged = True
-            for repo_dir in feat_dir.iterdir():
+            for repo_dir in slot_dir.iterdir():
                 if not repo_dir.is_dir():
                     continue
                 try:
@@ -1158,9 +1226,15 @@ class FeatureCoordinator:
                     pass
 
             if all_clean and all_merged:
-                stale.append({"name": feat_name, "reason": "clean and merged"})
+                stale.append({
+                    "name": feat_name, "slot_id": slot_id,
+                    "reason": "clean and merged",
+                })
             elif all_clean:
-                stale.append({"name": feat_name, "reason": "clean (not yet merged)"})
+                stale.append({
+                    "name": feat_name, "slot_id": slot_id,
+                    "reason": "clean (not yet merged)",
+                })
 
         return stale
 
