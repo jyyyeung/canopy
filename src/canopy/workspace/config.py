@@ -65,7 +65,7 @@ class WorkspaceConfig:
     name: str
     repos: list[RepoConfig]
     root: Path              # absolute path to workspace root
-    max_worktrees: int = 0  # 0 = unlimited
+    slots: int = 2          # warm slot count (canonical is separate); default 2
     issue_provider: IssueProviderConfig = field(default_factory=IssueProviderConfig)
     augments: dict[str, Any] = field(default_factory=dict)  # workspace-level augment defaults (M2)
     # M6 — IDE workspace template + per-workspace bootstrap default.
@@ -164,7 +164,14 @@ def _parse_config(data: dict[str, Any], root: Path) -> WorkspaceConfig:
             ide_settings=dict(ide_settings) if ide_settings else {},
         ))
 
-    max_worktrees = workspace.get("max_worktrees", 0)
+    if "max_worktrees" in workspace:
+        raise ConfigError(
+            "max_worktrees was renamed to `slots` in canopy 3.0 — "
+            "run `canopy migrate-slots` to update canopy.toml"
+        )
+    slots_count = workspace.get("slots", 2)
+    if not isinstance(slots_count, int) or slots_count < 1:
+        raise ConfigError(f"slots must be a positive integer, got: {slots_count!r}")
     ide_choice = workspace.get("ide", "none")
     if not isinstance(ide_choice, str):
         raise ConfigError(f"[workspace] ide must be a string, got {type(ide_choice).__name__}")
@@ -176,7 +183,7 @@ def _parse_config(data: dict[str, Any], root: Path) -> WorkspaceConfig:
         name=name,
         repos=repos,
         root=root,
-        max_worktrees=max_worktrees,
+        slots=slots_count,
         issue_provider=issue_provider,
         augments=augments,
         ide=ide_choice,
@@ -244,7 +251,7 @@ def _parse_issue_provider(data: dict[str, Any]) -> IssueProviderConfig:
 # Settings that can be read/written via `canopy config`
 WORKSPACE_SETTINGS = {
     "name": str,
-    "max_worktrees": int,
+    "slots": int,
 }
 
 

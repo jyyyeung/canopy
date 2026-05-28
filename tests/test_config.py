@@ -222,3 +222,53 @@ path = "./api"
     config = load_config(tmp_path)
     assert config.augments["future_key"] == "value"
     assert config.augments["another"] == 42
+
+
+# ── slots field (Wave 3.0) ───────────────────────────────────────────────
+
+
+def test_slots_field_parses(tmp_path):
+    toml = tmp_path / "canopy.toml"
+    toml.write_text("""
+[workspace]
+name = "ws"
+slots = 3
+
+[[repos]]
+name = "a"
+path = "a"
+""")
+    (tmp_path / "a").mkdir()
+    cfg = load_config(tmp_path)
+    assert cfg.slots == 3
+
+
+def test_slots_default_is_two(tmp_path):
+    toml = tmp_path / "canopy.toml"
+    toml.write_text("""
+[workspace]
+name = "ws"
+
+[[repos]]
+name = "a"
+path = "a"
+""")
+    (tmp_path / "a").mkdir()
+    cfg = load_config(tmp_path)
+    assert cfg.slots == 2
+
+
+def test_max_worktrees_field_rejected(tmp_path):
+    toml = tmp_path / "canopy.toml"
+    toml.write_text("""
+[workspace]
+name = "ws"
+max_worktrees = 3
+
+[[repos]]
+name = "a"
+path = "a"
+""")
+    (tmp_path / "a").mkdir()
+    with pytest.raises(ConfigError, match=r"max_worktrees was renamed to `slots`"):
+        load_config(tmp_path)
