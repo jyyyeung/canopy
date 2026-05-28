@@ -129,6 +129,7 @@ STATE_CATEGORIES = {
     "preflight",
     "features",
     "branches",
+    "slots",
 }
 INSTALL_CATEGORIES = {"cli", "mcp", "skill", "vsix"}
 ALL_CATEGORIES = STATE_CATEGORIES | INSTALL_CATEGORIES
@@ -460,6 +461,117 @@ def check_branches_missing(workspace: Workspace) -> list[Issue]:
     return issues
 
 
+# ── Slot-state checks ───────────────────────────────────────────────────
+
+
+def check_slot_dir_orphans(workspace: Workspace) -> list[Issue]:
+    """Find .canopy/worktrees/worktree-N/ dirs with no entry in slots.json."""
+    import re
+    from . import slots as slots_mod
+
+    wt_base = workspace.config.root / ".canopy" / "worktrees"
+    if not wt_base.is_dir():
+        return []
+    state = slots_mod.read_state(workspace)
+    occupied = set(state.slots.keys()) if state is not None else set()
+    issues: list[Issue] = []
+    for d in sorted(wt_base.iterdir()):
+        if not d.is_dir():
+            continue
+        if not re.fullmatch(r"worktree-\d+", d.name):
+            continue
+        if d.name not in occupied:
+            issues.append(Issue(
+                code="slot_dir_orphan",
+                severity="warn",
+                what=f"slot dir '{d.name}' exists but no entry in slots.json",
+                expected="slot entry in slots.json",
+                actual=str(d),
+                fix_action=f"canopy doctor --gc removes {d.name}/; or canopy slot load <feature> {d.name}",
+                auto_fixable=False,
+                details={"slot": d.name, "path": str(d)},
+            ))
+    return issues
+
+
+def check_slot_entry_orphans(workspace: Workspace) -> list[Issue]:
+    """Find slots.json entries whose worktree dir is gone.
+
+    Reads raw JSON — ``read_state`` silently drops missing-dir entries,
+    which would hide them from this check.
+    """
+    state_path = workspace.config.root / ".canopy" / "state" / "slots.json"
+    if not state_path.exists():
+        return []
+    try:
+        data = json.loads(state_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    wt_base = workspace.config.root / ".canopy" / "worktrees"
+    issues: list[Issue] = []
+    for sid, entry in (data.get("slots") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        if not (wt_base / sid).exists():
+            issues.append(Issue(
+                code="slot_entry_orphan",
+                severity="warn",
+                what=f"slots.json references '{sid}' but the dir is gone",
+                expected=str(wt_base / sid),
+                actual="(does not exist)",
+                feature=entry.get("feature"),
+                fix_action=f"drop the slots.json entry for {sid}",
+                auto_fixable=True,
+                details={"slot": sid, "feature": entry.get("feature"),
+                          "expected_path": str(wt_base / sid)},
+            ))
+    return issues
+
+
+def check_slot_branch_mismatches(workspace: Workspace) -> list[Issue]:
+    """Find slots where the worktree HEAD doesn't match the feature's expected branch."""
+    from . import slots as slots_mod
+    from .aliases import repos_for_feature
+
+    state = slots_mod.read_state(workspace)
+    if state is None:
+        return []
+    issues: list[Issue] = []
+    for sid, entry in state.slots.items():
+        repo_branches = repos_for_feature(workspace, entry.feature) or {}
+        for repo_name, expected_branch in repo_branches.items():
+            slot_path = slots_mod.slot_worktree_path(workspace, sid, repo_name)
+            if not slot_path.exists():
+                continue
+            try:
+                actual_branch = git.current_branch(slot_path)
+            except Exception:
+                continue
+            if actual_branch != expected_branch:
+                issues.append(Issue(
+                    code="slot_branch_mismatch",
+                    severity="warn",
+                    what=(
+                        f"slot '{sid}' repo '{repo_name}' is on '{actual_branch}'"
+                        f" but feature '{entry.feature}' expects '{expected_branch}'"
+                    ),
+                    expected=expected_branch,
+                    actual=actual_branch,
+                    repo=repo_name,
+                    feature=entry.feature,
+                    fix_action=(
+                        f"git checkout {expected_branch} in {sid}/{repo_name};"
+                        f" or re-record via canopy slot load --replace"
+                    ),
+                    auto_fixable=False,
+                    details={
+                        "slot": sid, "feature": entry.feature, "repo": repo_name,
+                        "expected_branch": expected_branch, "actual_branch": actual_branch,
+                    },
+                ))
+    return issues
+
+
 # ── Install-staleness checks ─────────────────────────────────────────────
 
 
@@ -749,6 +861,9 @@ _CHECKS: dict[str, tuple[str, Any]] = {
     "skill_stale": ("skill", check_skill_stale),
     "mcp_orphans": ("mcp", check_mcp_orphans),
     "vsix_duplicates": ("vsix", check_vsix_duplicates),
+    "slot_dir_orphan": ("slots", check_slot_dir_orphans),
+    "slot_entry_orphan": ("slots", check_slot_entry_orphans),
+    "slot_branch_mismatch": ("slots", check_slot_branch_mismatches),
 }
 
 
@@ -1097,6 +1212,33 @@ def repair_vsix_duplicates(workspace: Workspace, issue: Issue) -> RepairResult:
                         action_taken=f"kept {keep.name}; removed {len(removed)} stale dirs")
 
 
+def repair_slot_entry_orphan(workspace: Workspace, issue: Issue) -> RepairResult:
+    """Drop the orphaned slots.json entry whose dir is gone."""
+    state_path = workspace.config.root / ".canopy" / "state" / "slots.json"
+    sid = (issue.details or {}).get("slot")
+    if not sid:
+        return RepairResult(code=issue.code, success=False, action_taken="",
+                            error="missing slot in issue details")
+    if not state_path.exists():
+        return RepairResult(code=issue.code, success=True,
+                            action_taken="slots.json already absent")
+    try:
+        data = json.loads(state_path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        return RepairResult(code=issue.code, success=False, action_taken="",
+                            error=str(e))
+    slots = data.get("slots")
+    if not isinstance(slots, dict) or sid not in slots:
+        return RepairResult(code=issue.code, success=True,
+                            action_taken=f"entry '{sid}' already absent from slots.json")
+    slots.pop(sid)
+    tmp = state_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(state_path)
+    return RepairResult(code=issue.code, success=True,
+                        action_taken=f"dropped slots.json entry for '{sid}'")
+
+
 _REPAIRS: dict[str, Any] = {
     "heads_stale": repair_heads_stale,
     "active_feature_orphan": repair_active_feature_orphan,
@@ -1111,9 +1253,10 @@ _REPAIRS: dict[str, Any] = {
     "skill_stale": repair_skill_stale,
     "mcp_orphans": repair_mcp_orphans,
     "vsix_duplicates": repair_vsix_duplicates,
-    # cli_stale, mcp_stale, features_unknown_repo, branches_missing have
-    # no auto-fix — repair returns surfaced advice via the issue's
-    # `fix_action` instead.
+    "slot_entry_orphan": repair_slot_entry_orphan,
+    # cli_stale, mcp_stale, features_unknown_repo, branches_missing,
+    # slot_dir_orphan, slot_branch_mismatch have no auto-fix —
+    # repair returns surfaced advice via the issue's `fix_action` instead.
 }
 
 

@@ -832,3 +832,40 @@ def test_e2e_returns_serializable_result(workspace_with_feature):
     text = json.dumps(report, default=str)
     parsed = json.loads(text)
     assert parsed["summary"] == report["summary"]
+
+
+# ── slot state checks (T19) ─────────────────────────────────────────────
+
+
+def test_doctor_finds_slot_dir_orphan(workspace_with_canonical_only):
+    """A worktree-N dir on disk without a slots.json entry → slot_dir_orphan finding."""
+    root = workspace_with_canonical_only.config.root
+    orphan_dir = root / ".canopy/worktrees/worktree-1/repo-a"
+    orphan_dir.mkdir(parents=True, exist_ok=True)
+    result = doctor(workspace_with_canonical_only)
+    findings = [f for f in result["issues"] if f["code"] == "slot_dir_orphan"]
+    assert any("worktree-1" in f["what"] for f in findings)
+
+
+def test_doctor_finds_slot_entry_orphan(workspace_with_slots):
+    """A slots.json entry without a matching dir → slot_entry_orphan finding."""
+    import shutil
+    root = workspace_with_slots.config.root
+    shutil.rmtree(root / ".canopy/worktrees/worktree-1")
+    result = doctor(workspace_with_slots)
+    findings = [f for f in result["issues"] if f["code"] == "slot_entry_orphan"]
+    assert any("worktree-1" in f.get("what", "") for f in findings)
+
+
+def test_doctor_finds_slot_branch_mismatch(workspace_with_slots):
+    """A slot's worktree is on a different branch than slots.json records → mismatch."""
+    import subprocess
+    root = workspace_with_slots.config.root
+    # Detach HEAD so current_branch returns something other than the recorded feature branch
+    subprocess.run(
+        ["git", "checkout", "--detach"],
+        cwd=root / ".canopy/worktrees/worktree-1/repo-a", check=True,
+    )
+    result = doctor(workspace_with_slots)
+    findings = [f for f in result["issues"] if f["code"] == "slot_branch_mismatch"]
+    assert any("worktree-1" in f.get("what", "") for f in findings)
