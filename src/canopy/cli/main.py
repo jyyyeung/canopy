@@ -2077,6 +2077,11 @@ def cmd_setup_agent(args: argparse.Namespace) -> None:
             console.print(f"  mcp     [success]✓ configured[/]  [muted]CANOPY_ROOT={root}[/]")
         else:
             console.print(f"  mcp     [error]✗ not configured[/]  [muted]{mcp['path']}[/]")
+        hooks_state = status.get("hooks") or {}
+        if hooks_state.get("configured"):
+            console.print(f"  hooks   [success]✓ installed[/]  [muted]{hooks_state.get('path', '')}[/]")
+        else:
+            console.print(f"  hooks   [muted]· not installed[/]  [muted]{hooks_state.get('path', '')}[/]")
         console.print()
         return
 
@@ -2101,6 +2106,27 @@ def cmd_setup_agent(args: argparse.Namespace) -> None:
     result = setup_agent(
         workspace_root, skills=skills, do_mcp=do_mcp, reinstall=args.reinstall,
     )
+
+    if args.hooks:
+        from ..agent_setup import install_hooks
+        if workspace_root is None:
+            # Resolve the workspace without _load_workspace()'s sys.exit —
+            # a missing workspace must not discard the skill/MCP result
+            # already computed above; report hooks as skipped instead.
+            from ..workspace.config import load_config
+            from ..workspace.workspace import Workspace
+            try:
+                workspace_root = Workspace(load_config()).config.root
+            except Exception:
+                workspace_root = None
+        if workspace_root is None:
+            result["hooks"] = {
+                "action": "skipped", "path": "",
+                "reason": "no canopy workspace found — run `canopy setup-agent --hooks` from inside one",
+            }
+        else:
+            result["hooks"] = install_hooks(workspace_root)
+
     if args.json:
         _print_json(result)
         return
@@ -2127,6 +2153,16 @@ def cmd_setup_agent(args: argparse.Namespace) -> None:
         console.print(f"  mcp     {glyph}  [muted]{m['path']}[/]")
         if m.get("reason"):
             console.print(f"          [muted]{m['reason']}[/]")
+    if "hooks" in result:
+        h = result["hooks"]
+        glyph = {
+            "added": "[success]✓ installed[/]",
+            "unchanged": "[muted]· already installed[/]",
+            "skipped": "[warning]● skipped[/]",
+        }.get(h["action"], h["action"])
+        console.print(f"  hooks   {glyph}  [muted]{h['path']}[/]")
+        if h.get("reason"):
+            console.print(f"          [muted]{h['reason']}[/]")
     console.print()
     console.print("  [muted]Restart Claude Code (or open a new session) to pick up changes.[/]")
     console.print()
@@ -3810,6 +3846,8 @@ def main() -> None:
                                "Repeatable. The default 'using-canopy' skill is always installed.")
     setup_p.add_argument("--reinstall", action="store_true",
                           help="Overwrite existing files even if foreign or current")
+    setup_p.add_argument("--hooks", action="store_true",
+                          help="Install Claude Code enforcement hooks into <workspace>/.claude/settings.json")
     setup_p.add_argument("--check", action="store_true",
                           help="Report status without changing anything")
     setup_p.add_argument("--json", action="store_true", help="Output as JSON")
