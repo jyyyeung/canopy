@@ -11,6 +11,22 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _no_background_bootstrap():
+    """Tests must not spawn real detached bootstrap processes — they race
+    with git/state ops on the shared tmp repos and make CI flaky. The
+    background spawn's logic is covered in isolation (test_slot_bootstrap
+    monkeypatches _spawn_deps_background; test_slots_concurrency tests the
+    real multiprocess slots.json safety). See phase-4 CANOPY_NO_BG_BOOTSTRAP."""
+    prev = os.environ.get("CANOPY_NO_BG_BOOTSTRAP")
+    os.environ["CANOPY_NO_BG_BOOTSTRAP"] = "1"
+    yield
+    if prev is None:
+        os.environ.pop("CANOPY_NO_BG_BOOTSTRAP", None)
+    else:
+        os.environ["CANOPY_NO_BG_BOOTSTRAP"] = prev
+
+
 def _git(args: list[str], cwd: Path) -> str:
     """Run a git command in a directory."""
     result = subprocess.run(
@@ -147,6 +163,7 @@ slots = 2
 [[repos]]
 name = "repo-a"
 path = "repo-a"
+install_cmd = "true"
 
 [[repos]]
 name = "repo-b"
@@ -188,8 +205,10 @@ def workspace_with_canonical_only(canopy_toml_for_workspace):
 def workspace_with_slots(workspace_with_canonical_only):
     """X canonical, Y warm in worktree-1."""
     from canopy.actions.switch import switch
-    switch(workspace_with_canonical_only, "Y")  # Y canonical, X warm slot-1
-    switch(workspace_with_canonical_only, "X")  # X canonical, Y warm slot-1
+    # evict_to pins the vacating feature warm (the Phase-4 default would
+    # send a clean, PR-less feature cold); slot ids match the old default.
+    switch(workspace_with_canonical_only, "Y", evict_to="worktree-1")  # X warm slot-1
+    switch(workspace_with_canonical_only, "X", evict_to="worktree-1")  # Y warm slot-1
     return workspace_with_canonical_only
 
 
@@ -202,9 +221,11 @@ def workspace_with_full_slots(workspace_with_canonical_only):
             subprocess.run(["git", "branch", branch],
                            cwd=ws.config.root / repo, check=True)
     from canopy.actions.switch import switch
-    switch(ws, "A")  # X→warm slot-1, A canonical
-    switch(ws, "B")  # A→warm slot-2, B canonical
-    switch(ws, "X")  # B→warm? — keeps X canonical with A and B warm
+    # evict_to pins each vacating feature warm (Phase-4 default sends
+    # clean, PR-less features cold); slot ids match the old default.
+    switch(ws, "A", evict_to="worktree-1")  # X→warm slot-1, A canonical
+    switch(ws, "B", evict_to="worktree-2")  # A→warm slot-2, B canonical
+    switch(ws, "X", evict_to="worktree-1")  # B→warm slot-1 (fastpath), X canonical
     # Deterministic LRU ordering: A newer, B older
     from canopy.actions import slots as sm
     state = sm.read_state(ws)

@@ -30,7 +30,7 @@ from .aliases import resolve_feature
 from .errors import BlockerError
 from .ide_workspace import render_code_workspace
 
-ALLOWED_STEPS = ("env", "deps", "ide")
+ALLOWED_STEPS = ("env", "deps", "ide", "hooks")
 
 
 def bootstrap_feature(
@@ -39,6 +39,7 @@ def bootstrap_feature(
     *,
     force: bool = False,
     steps: Iterable[str] | None = None,
+    interactive: bool = False,
 ) -> dict[str, Any]:
     """Run all three steps for every repo in a feature.
 
@@ -47,6 +48,8 @@ def bootstrap_feature(
         feature: feature alias.
         force: overwrite existing destination env files.
         steps: subset of {"env", "deps", "ide"} to run; default = all.
+        interactive: run the deps install in the foreground (stream output,
+            allow prompts) instead of capturing its stdio.
 
     Returns ``{feature, results: {<repo>: {env, deps}}, ide}``.
     Per-step result shape::
@@ -73,7 +76,7 @@ def bootstrap_feature(
     for repo_name, worktree_path in worktree_paths.items():
         results[repo_name] = bootstrap_repo(
             workspace, feature_name, repo_name, worktree_path,
-            force=force, steps=chosen_steps,
+            force=force, steps=chosen_steps, interactive=interactive,
         )
 
     ide_result: dict[str, Any]
@@ -97,6 +100,7 @@ def bootstrap_repo(
     *,
     force: bool = False,
     steps: Iterable[str] = ALLOWED_STEPS,
+    interactive: bool = False,
 ) -> dict[str, Any]:
     """Run env-copy + deps-install for a single repo's worktree."""
     chosen = set(steps)
@@ -117,11 +121,17 @@ def bootstrap_repo(
     deps_result: dict[str, Any] = {"status": "skipped"}
     if "deps" in chosen:
         if repo_config.install_cmd:
-            deps_result = _run_install(repo_config.install_cmd, worktree_path)
+            deps_result = _run_deps(
+                workspace, repo_config.install_cmd, worktree_path,
+                interactive=interactive,
+            )
         else:
             deps_result = {"status": "skipped", "reason": "no install_cmd configured"}
 
-    return {"env": env_result, "deps": deps_result}
+    result: dict[str, Any] = {"env": env_result, "deps": deps_result}
+    if "hooks" in chosen:
+        result["hooks"] = _run_hook_install(worktree_path, repo_config)
+    return result
 
 
 # ── step 1: env-file copy ──────────────────────────────────────────────
@@ -175,13 +185,87 @@ def _copy_env_files(
 
 # ── step 2: dep install ────────────────────────────────────────────────
 
-def _run_install(install_cmd: str, worktree_path: Path) -> dict[str, Any]:
-    """Run ``install_cmd`` in ``worktree_path`` and capture exit + duration."""
+_LOCKFILE_NAMES = ("pnpm-lock.yaml", "package-lock.json", "yarn.lock", "requirements.txt")
+
+
+def _lockfile_hash(worktree_path: Path) -> str | None:
+    """Hash the first known lockfile found in ``worktree_path``, or None."""
+    import hashlib
+    for name in _LOCKFILE_NAMES:
+        candidate = worktree_path / name
+        if candidate.exists():
+            return hashlib.sha256(candidate.read_bytes()).hexdigest()
+    return None
+
+
+def _fingerprints_path(workspace: Workspace) -> Path:
+    return workspace.config.root / ".canopy" / "state" / "deps_fingerprints.json"
+
+
+def _read_fingerprints(workspace: Workspace) -> dict[str, str]:
+    import json
+    path = _fingerprints_path(workspace)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_fingerprint(workspace: Workspace, worktree_path: Path, sha: str) -> None:
+    import json
+    path = _fingerprints_path(workspace)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = _read_fingerprints(workspace)
+    data[str(worktree_path.resolve())] = sha
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(path)
+
+
+def _run_deps(
+    workspace: Workspace, install_cmd: str, worktree_path: Path,
+    *, interactive: bool = False,
+) -> dict[str, Any]:
+    """Run the deps install, short-circuiting when unchanged since last install.
+
+    Fingerprints the worktree's lockfile (pnpm/npm/yarn/pip, first match) and
+    compares against the hash recorded for this worktree in the workspace's
+    ``.canopy/state/deps_fingerprints.json``. The marker lives OUTSIDE the
+    worktree so it never dirties it (an in-tree marker made every warm slot
+    with real deps permanently dirty, defeating reclaim). If a lockfile exists
+    and matches, skip without running ``install_cmd``. Otherwise run it, and
+    on success record the new hash. Repos with no recognized lockfile always
+    run (no short-circuit).
+    """
+    current_hash = _lockfile_hash(worktree_path)
+    key = str(worktree_path.resolve())
+    if current_hash is not None:
+        if _read_fingerprints(workspace).get(key) == current_hash:
+            return {"status": "skipped", "reason": "lockfile unchanged"}
+
+    result = _run_install(install_cmd, worktree_path, interactive=interactive)
+    if current_hash is not None and result.get("status") == "ok":
+        _write_fingerprint(workspace, worktree_path, current_hash)
+    return result
+
+
+def _run_install(
+    install_cmd: str, worktree_path: Path, *, interactive: bool = False,
+) -> dict[str, Any]:
+    """Run ``install_cmd`` in ``worktree_path`` and capture exit + duration.
+
+    When ``interactive`` is True the subprocess inherits this process's
+    stdio (no capture) so it can stream output and satisfy prompts (auth,
+    a pnpm build-script approval) the detached background install can't.
+    """
     import time
     start = time.monotonic()
     proc = subprocess.run(
         install_cmd, shell=True, cwd=worktree_path,
-        capture_output=True, text=True,
+        capture_output=not interactive, text=True,
     )
     duration_ms = int((time.monotonic() - start) * 1000)
     out: dict[str, Any] = {
@@ -189,13 +273,47 @@ def _run_install(install_cmd: str, worktree_path: Path) -> dict[str, Any]:
         "exit_code": proc.returncode,
         "duration_ms": duration_ms,
     }
-    if proc.returncode != 0:
+    if proc.returncode != 0 and proc.stderr is not None:
         # Tail the last few lines of stderr — full output would balloon
         # the JSON return for the dashboard. Caller can rerun manually
-        # for full output if needed.
+        # for full output if needed. (Interactive runs stream instead of
+        # capturing, so there's no captured stderr to tail.)
         tail = "\n".join(proc.stderr.splitlines()[-10:])
         out["stderr_tail"] = tail
     return out
+
+
+# ── step: per-clone hook install ───────────────────────────────────────
+
+def _run_hook_install(worktree_path: Path, repo_cfg) -> dict[str, Any]:
+    """Install per-clone git hooks (husky-style) in a worktree.
+
+    If package.json has a "prepare" script (husky's install hook), run it
+    via the repo's package manager (idempotent, fast — no full install).
+    Else if a .husky/ dir exists, point core.hooksPath at it. No-op
+    otherwise.
+    """
+    import json as _json
+    from ..git import repo as git
+    pkg = worktree_path / "package.json"
+    if pkg.exists():
+        try:
+            data = _json.loads(pkg.read_text())
+            if "prepare" in (data.get("scripts") or {}):
+                pm = "pnpm" if (worktree_path / "pnpm-lock.yaml").exists() else "npm"
+                cp = subprocess.run([pm, "run", "prepare"], cwd=str(worktree_path),
+                                    capture_output=True, text=True)
+                return {"status": "ok" if cp.returncode == 0 else "failed",
+                        "mechanism": f"{pm}-prepare", "exit_code": cp.returncode}
+        except Exception as e:
+            return {"status": "failed", "error": str(e)}
+    if (worktree_path / ".husky").is_dir():
+        try:
+            git.set_hooks_path(worktree_path, ".husky")
+            return {"status": "ok", "mechanism": "hooksPath"}
+        except Exception as e:
+            return {"status": "failed", "error": str(e)}
+    return {"status": "skipped", "reason": "no husky/prepare detected"}
 
 
 # ── step 3: IDE workspace file ─────────────────────────────────────────

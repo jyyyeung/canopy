@@ -103,7 +103,7 @@ def test_validate_steps_rejects_unknown():
 
 
 def test_validate_steps_default_is_all():
-    assert _validate_steps(None) == {"env", "deps", "ide"}
+    assert _validate_steps(None) == {"env", "deps", "ide", "hooks"}
 
 
 # ── ide-workspace renderer ────────────────────────────────────────────
@@ -210,6 +210,36 @@ def test_bootstrap_feature_blocks_when_no_worktrees(workspace_with_bootstrap_con
     assert e.value.code == "no_worktrees"
 
 
+def _ws(root):
+    from canopy.workspace.workspace import Workspace
+    from canopy.workspace.config import load_config
+    return Workspace(load_config(root))
+
+
+# ── hooks step (per-clone husky install) ───────────────────────────────
+
+def test_bootstrap_hooks_step_installs(canopy_toml_for_workspace, monkeypatch):
+    from canopy.actions import bootstrap
+    calls = []
+    monkeypatch.setattr(bootstrap, "_run_hook_install",
+                        lambda worktree_path, repo_cfg: calls.append(worktree_path) or
+                        {"status": "ok", "mechanism": "husky-prepare"})
+    root = canopy_toml_for_workspace
+    result = bootstrap.bootstrap_repo(
+        _ws(root), "auth-flow", "repo-a", root / "repo-a", steps=("hooks",))
+    assert result["hooks"]["status"] == "ok"
+    assert calls
+
+
+def test_bootstrap_hooks_skipped_when_no_husky(canopy_toml_for_workspace):
+    from canopy.actions import bootstrap
+    root = canopy_toml_for_workspace
+    # repo-a has no package.json prepare script and no .husky/ → skipped
+    result = bootstrap.bootstrap_repo(
+        _ws(root), "auth-flow", "repo-a", root / "repo-a", steps=("hooks",))
+    assert result["hooks"]["status"] == "skipped"
+
+
 def test_resolve_worktree_paths_uses_slots_json_for_warm_feature(workspace_with_slots):
     """Wave 3.0: a warm feature's worktree paths come from its SLOT, not the
     legacy features.json worktree_paths cache (which is empty in 3.0). Before
@@ -225,3 +255,66 @@ def test_resolve_worktree_paths_uses_slots_json_for_warm_feature(workspace_with_
     assert set(paths) == {"repo-a", "repo-b"}
     assert paths["repo-a"] == sm.slot_worktree_path(ws, sid, "repo-a")
     assert (paths["repo-a"] / ".git").exists()
+
+
+# ── bootstrap status marker (Task 7) ───────────────────────────────────
+
+def test_bootstrap_status_marker_helpers(canopy_toml_for_workspace):
+    from canopy.actions import slots as sm
+    ws = _ws(canopy_toml_for_workspace)
+    sm.set_bootstrap_status(ws, "worktree-1", "repo-a", "installing")
+    assert sm.get_bootstrap_status(ws, "worktree-1", "repo-a") == "installing"
+    sm.set_bootstrap_status(ws, "worktree-1", "repo-a", "ready")
+    assert sm.get_bootstrap_status(ws, "worktree-1", "repo-a") == "ready"
+
+
+def test_bootstrap_status_preserves_other_state(canopy_toml_for_workspace):
+    from canopy.actions import slots as sm
+    ws = _ws(canopy_toml_for_workspace)
+    st = sm.SlotState(slot_count=2)
+    st.last_touched["feat-x"] = "2026-01-01T00:00:00Z"
+    sm.write_state(ws, st)
+    sm.set_bootstrap_status(ws, "worktree-1", "repo-a", "installing")
+    reloaded = sm.read_state(ws)
+    assert reloaded.last_touched.get("feat-x") == "2026-01-01T00:00:00Z"  # untouched
+    assert reloaded.bootstrap["worktree-1"]["repo-a"] == "installing"
+
+
+def test_deps_skipped_when_lockfile_unchanged(canopy_toml_for_workspace, monkeypatch):
+    from canopy.actions import bootstrap
+    root = canopy_toml_for_workspace
+    ran = []
+    monkeypatch.setattr(bootstrap, "_run_install",
+                        lambda *a, **k: ran.append(1) or {"status": "ok", "exit_code": 0})
+    wt = root / "repo-a"
+    (wt / "pnpm-lock.yaml").write_text("lock-v1\n")
+    bootstrap.bootstrap_repo(_ws(root), "auth-flow", "repo-a", wt, steps=("deps",))
+    bootstrap.bootstrap_repo(_ws(root), "auth-flow", "repo-a", wt, steps=("deps",))
+    assert len(ran) == 1                     # second call short-circuits
+
+
+def test_deps_marker_does_not_dirty_worktree(canopy_toml_for_workspace, monkeypatch):
+    """FIX B: the deps-lock fingerprint must live OUTSIDE the worktree, so a
+    warm slot with real deps isn't left permanently dirty (which defeats
+    reclaim — every merged slot would look reclaimable_but_dirty forever)."""
+    import subprocess
+    from canopy.actions import bootstrap
+    from canopy.git import repo as git
+    root = canopy_toml_for_workspace
+    wt = root / "repo-a"
+    # Commit a lockfile so the ONLY thing that could dirty the tree is a
+    # stray marker written by the deps step.
+    (wt / "pnpm-lock.yaml").write_text("lock-v1\n")
+    subprocess.run(["git", "add", "."], cwd=wt, check=True)
+    subprocess.run(["git", "commit", "-m", "add lockfile"], cwd=wt, check=True)
+    assert git.is_dirty(wt) is False          # clean baseline
+
+    ran = []
+    monkeypatch.setattr(bootstrap, "_run_install",
+                        lambda *a, **k: ran.append(1) or {"status": "ok", "exit_code": 0})
+    bootstrap.bootstrap_repo(_ws(root), "auth-flow", "repo-a", wt, steps=("deps",))
+    assert git.is_dirty(wt) is False          # NO stray marker in the tree
+    assert len(ran) == 1
+    # Second run must still short-circuit on the out-of-tree fingerprint.
+    bootstrap.bootstrap_repo(_ws(root), "auth-flow", "repo-a", wt, steps=("deps",))
+    assert len(ran) == 1

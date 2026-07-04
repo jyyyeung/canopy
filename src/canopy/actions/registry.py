@@ -166,10 +166,25 @@ def context(workspace: Workspace, *, cwd: Path | None = None,
                       "root": str(workspace.config.root),
                       "active_feature": active_feat},
         "features": features,
-        "slots": {sid: e.feature for sid, e in (state.slots.items() if state else [])},
         "advisories": _compute_advisories(workspace, active_feat),
         "detected": _detected(workspace, cwd),
     }
     if remote:
         _remote_overlay(workspace, out, author)
+        # Reclaim merged slots BEFORE snapshotting slots, so a freed slot
+        # doesn't linger in the output. Re-read state after reclaim.
+        try:
+            from . import reclaim
+            reclaim.reclaim_merged(workspace)
+        except Exception:
+            pass
+        state = slots_mod.read_state(workspace)
+
+    bootstrap_map = state.bootstrap if state else {}
+    out_slots: dict[str, Any] = {}
+    if state:
+        for sid, e in state.slots.items():
+            out_slots[sid] = {"feature": e.feature,
+                              "bootstrap": dict(bootstrap_map.get(sid, {}))}
+    out["slots"] = out_slots
     return out
