@@ -35,6 +35,12 @@ class RepoConfig:
     # M6 worktree-bootstrap fields. All optional — missing means "skip
     # this step." See docs/plans/worktree-bootstrap.md.
     env_files: list[str] = field(default_factory=list)
+    # L-2: like env_files but symlinks instead of copies. Use for shared /
+    # mutable dirs (transcripts, data, output) that must stay identical to
+    # the main checkout — copying would fork their state. Mirrors env_files
+    # semantics exactly (same source root, same missing-source / dest-exists
+    # policy); only the materialization differs (os.symlink vs shutil.copy2).
+    link_files: list[str] = field(default_factory=list)
     install_cmd: str = ""
     ide_settings: dict[str, Any] = field(default_factory=dict)
 
@@ -147,6 +153,13 @@ def _parse_config(data: dict[str, Any], root: Path) -> WorkspaceConfig:
             raise ConfigError(
                 f"[[repos]] entry '{repo_name}' env_files must be a list of strings",
             )
+        link_files = entry.get("link_files") or []
+        if link_files and not (
+            isinstance(link_files, list) and all(isinstance(p, str) for p in link_files)
+        ):
+            raise ConfigError(
+                f"[[repos]] entry '{repo_name}' link_files must be a list of strings",
+            )
         ide_settings = entry.get("ide_settings")
         if ide_settings is not None and not isinstance(ide_settings, dict):
             raise ConfigError(
@@ -160,6 +173,7 @@ def _parse_config(data: dict[str, Any], root: Path) -> WorkspaceConfig:
             default_branch=entry.get("default_branch", "main"),
             augments=dict(repo_augments) if repo_augments else {},
             env_files=list(env_files),
+            link_files=list(link_files),
             install_cmd=entry.get("install_cmd", "") or "",
             ide_settings=dict(ide_settings) if ide_settings else {},
         ))

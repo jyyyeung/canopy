@@ -272,3 +272,44 @@ path = "a"
     (tmp_path / "a").mkdir()
     with pytest.raises(ConfigError, match=r"max_worktrees was renamed to `slots`"):
         load_config(tmp_path)
+
+
+# ── link_files field (L-2) ───────────────────────────────────────────────
+
+
+def test_link_files_parsed(tmp_path):
+    """L-2: link_files is parsed from canopy.toml into RepoConfig.link_files,
+    mirroring env_files. Empty/missing defaults to []."""
+    (tmp_path / "canopy.toml").write_text("""
+[workspace]
+name = "ws"
+
+[[repos]]
+name = "a"
+path = "a"
+link_files = ["transcripts", "data", "output", ".cursor"]
+
+[[repos]]
+name = "b"
+path = "b"
+""")
+    config = load_config(tmp_path)
+    a = next(r for r in config.repos if r.name == "a")
+    b = next(r for r in config.repos if r.name == "b")
+    assert a.link_files == ["transcripts", "data", "output", ".cursor"]
+    assert b.link_files == []                       # default empty
+
+
+def test_link_files_must_be_list_of_strings(tmp_path):
+    """Type validation matches env_files: non-list / non-string entries are rejected."""
+    (tmp_path / "canopy.toml").write_text("""
+[workspace]
+name = "ws"
+
+[[repos]]
+name = "a"
+path = "a"
+link_files = "not-a-list"
+""")
+    with pytest.raises(ConfigError, match="link_files must be a list of strings"):
+        load_config(tmp_path)

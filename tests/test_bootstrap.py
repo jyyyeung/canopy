@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 
 from canopy.actions.bootstrap import (
-    _copy_env_files, _run_install, _validate_steps,
+    _copy_env_files, _link_files, _run_install, _validate_steps,
     bootstrap_feature, bootstrap_repo,
 )
 from canopy.actions.ide_workspace import render_code_workspace
@@ -73,6 +74,139 @@ def test_copy_env_files_nested_paths(tmp_path):
     result = _copy_env_files(["apps/web/.env.local"], src, dst, force=False)
     assert result["status"] == "ok"
     assert (dst / "apps" / "web" / ".env.local").read_text() == "WEB\n"
+
+
+# ── link-file symlink (L-2) ────────────────────────────────────────────
+
+def test_link_files_creates_symlink(tmp_path):
+    """Source exists in main checkout; after link, dest is a symlink whose
+    realpath resolves back to the source. Target stored relative for portability."""
+    src = tmp_path / "src"; src.mkdir()
+    dst = tmp_path / "dst"; dst.mkdir()
+    (src / "shared_dir").mkdir()
+    (src / "shared_dir" / "note.txt").write_text("hi\n")
+
+    result = _link_files(["shared_dir"], src, dst, force=False)
+    assert result["status"] == "ok"
+    assert result["files_linked"] == ["shared_dir"]
+    link = dst / "shared_dir"
+    assert os.path.islink(link)                       # is a symlink
+    assert os.path.realpath(link) == str(src / "shared_dir")
+    # The symlink target is stored relative (portable), not absolute.
+    assert not os.readlink(link).startswith("/")
+
+
+def test_link_files_missing_source(tmp_path):
+    """Source doesn't exist → bootstrap completes, status 'missing_source'.
+    Matches env_files missing-source behavior (file skipped, others proceed)."""
+    src = tmp_path / "src"; src.mkdir()
+    dst = tmp_path / "dst"; dst.mkdir()
+
+    result = _link_files(["shared_dir"], src, dst, force=False)
+    assert result["status"] == "missing_source"
+    assert result["files_missing"] == ["shared_dir"]
+    assert not (dst / "shared_dir").exists()
+
+
+def test_link_files_dest_exists_skipped(tmp_path):
+    """Dest already exists, force=False → skipped (NOT overwritten).
+    Matches env_files: env_files skips existing dests unless force=True; link_files
+    does the same so we don't silently clobber a real file in the worktree."""
+    src = tmp_path / "src"; src.mkdir()
+    dst = tmp_path / "dst"; dst.mkdir()
+    (src / "shared").mkdir()
+    (dst / "shared").write_text("LOCAL\n")            # regular file at dest
+
+    result = _link_files(["shared"], src, dst, force=False)
+    assert result["files_skipped"] == ["shared"]
+    assert not os.path.islink(dst / "shared")
+    assert (dst / "shared").read_text() == "LOCAL\n"  # untouched
+
+
+def test_link_files_force_replaces_existing(tmp_path):
+    """Dest already exists, force=True → removed, then symlinked.
+    Matches env_files force-overwrite semantics."""
+    src = tmp_path / "src"; src.mkdir()
+    dst = tmp_path / "dst"; dst.mkdir()
+    (src / "shared").mkdir()
+    (dst / "shared").write_text("LOCAL\n")
+
+    result = _link_files(["shared"], src, dst, force=True)
+    assert result["files_linked"] == ["shared"]
+    assert os.path.islink(dst / "shared")
+    assert os.path.realpath(dst / "shared") == str(src / "shared")
+
+
+def test_link_files_force_replaces_dangling_symlink(tmp_path):
+    """A pre-existing dangling symlink at dest must be replaceable under force.
+    `dst.exists()` returns False for dangling symlinks, so we check islink too."""
+    src = tmp_path / "src"; src.mkdir()
+    dst = tmp_path / "dst"; dst.mkdir()
+    (src / "shared").mkdir()
+    os.symlink("/nonexistent/target", dst / "shared")  # dangling
+
+    result = _link_files(["shared"], src, dst, force=True)
+    assert result["files_linked"] == ["shared"]
+    assert os.path.realpath(dst / "shared") == str(src / "shared")
+
+
+def test_link_files_creates_parent_dirs(tmp_path):
+    """Dest parent dir missing → created (mirrors env_files nested paths)."""
+    src = tmp_path / "src"; src.mkdir()
+    dst = tmp_path / "dst"; dst.mkdir()
+    (src / "deep" / "nested").mkdir(parents=True)
+    (src / "deep" / "nested" / "shared").mkdir()
+
+    result = _link_files(["deep/nested/shared"], src, dst, force=False)
+    assert result["status"] == "ok"
+    link = dst / "deep" / "nested" / "shared"
+    assert os.path.islink(link)
+    assert os.path.realpath(link) == str(src / "deep" / "nested" / "shared")
+
+
+def test_link_files_symlinks_directory_target(tmp_path):
+    """Symlink target is a directory → os.symlink creates a dir symlink
+    (not a recursive copy). This is the whole point for InspectEC's
+    shared dirs (transcripts/, data/, output/, .cursor/)."""
+    src = tmp_path / "src"; src.mkdir()
+    dst = tmp_path / "dst"; dst.mkdir()
+    shared = src / "data"; shared.mkdir()
+    (shared / "a.txt").write_text("a\n")
+    (shared / "b.txt").write_text("b\n")
+
+    result = _link_files(["data"], src, dst, force=False)
+    assert result["status"] == "ok"
+    link = dst / "data"
+    assert os.path.islink(link)
+    assert os.path.isdir(link)                          # resolves to a dir
+    # Writes through the symlink land in the source dir (shared mutable state).
+    (link / "c.txt").write_text("c\n")
+    assert (shared / "c.txt").read_text() == "c\n"
+
+
+def test_link_files_and_env_files_together(tmp_path):
+    """Both keys set in one repo → both run independently; env copies, link symlinks."""
+    src = tmp_path / "src"; src.mkdir()
+    dst = tmp_path / "dst"; dst.mkdir()
+    (src / ".env").write_text("FOO=bar\n")
+    (src / "shared").mkdir()
+
+    env_result = _copy_env_files([".env"], src, dst, force=False)
+    link_result = _link_files(["shared"], src, dst, force=False)
+    assert env_result["status"] == "ok" and env_result["files_copied"] == [".env"]
+    assert link_result["status"] == "ok" and link_result["files_linked"] == ["shared"]
+    assert (dst / ".env").read_text() == "FOO=bar\n"
+    assert os.path.islink(dst / "shared")
+
+
+def test_link_files_empty_default_no_crash(tmp_path):
+    """No link_files in config → _link_files([], ...) is a clean no-op."""
+    src = tmp_path / "src"; src.mkdir()
+    dst = tmp_path / "dst"; dst.mkdir()
+    result = _link_files([], src, dst, force=False)
+    assert result["status"] == "skipped"
+    assert result["files_linked"] == []
+    assert list(dst.iterdir()) == []
 
 
 # ── dep install ────────────────────────────────────────────────────────
@@ -164,6 +298,31 @@ def test_bootstrap_repo_runs_env_and_deps(tmp_path, workspace_with_bootstrap_con
     assert result["env"]["status"] == "ok"
     assert sorted(result["env"]["files_copied"]) == [".env", ".env.local"]
     assert result["deps"]["status"] == "ok"
+
+
+def test_bootstrap_repo_link_files_via_config(tmp_path, workspace_with_bootstrap_config):
+    """End-to-end: link_files declared in canopy.toml → bootstrap_repo symlinks
+    them from the main checkout into the worktree under the env step."""
+    workspace = workspace_with_bootstrap_config
+    repo_a = workspace.config.root / "repo-a"
+    # Declare link_files on repo-a by mutating the parsed config (the fixture's
+    # toml doesn't set it; we exercise the parser path separately in test_config).
+    state = workspace.get_repo("repo-a")
+    state.config.link_files = ["shared_data"]
+    shared = repo_a / "shared_data"; shared.mkdir()
+    (shared / "x.txt").write_text("x\n")
+
+    worktree = tmp_path / "wt-a"; worktree.mkdir()
+
+    result = bootstrap_repo(
+        workspace, "auth-flow", "repo-a", worktree,
+        force=False, steps=("env",),
+    )
+    assert result["link"]["status"] == "ok"
+    assert result["link"]["files_linked"] == ["shared_data"]
+    link = worktree / "shared_data"
+    assert os.path.islink(link)
+    assert os.path.realpath(link) == str(shared)
 
 
 # ── bootstrap_feature end-to-end ──────────────────────────────────────

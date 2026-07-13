@@ -4,6 +4,10 @@ Three optional steps, gated per repo + per invocation:
 
   1. **Env file copy** — per-repo ``env_files`` lists files (relative to
      repo root) to copy from the main checkout into the worktree.
+     Per-repo ``link_files`` (L-2) is the symlink equivalent: same source
+     root and policy, but symlinks instead of copies. Use it for shared /
+     mutable dirs (transcripts/, data/, output/) whose state must stay
+     identical to the main checkout — copying would fork them.
   2. **Dependency install** — per-repo ``install_cmd`` runs once in the
      worktree directory (e.g. ``uv sync`` / ``pnpm install``).
   3. **IDE workspace file** — workspace-level ``ide = "vscode"`` writes
@@ -20,6 +24,7 @@ retry just the failed step.
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -109,6 +114,7 @@ def bootstrap_repo(
     repo_config = state.config
 
     env_result: dict[str, Any] = {"status": "skipped", "files_copied": []}
+    link_result: dict[str, Any] = {"status": "skipped", "files_linked": []}
     if "env" in chosen:
         if repo_config.env_files:
             env_result = _copy_env_files(
@@ -117,6 +123,16 @@ def bootstrap_repo(
         else:
             env_result = {"status": "skipped", "files_copied": [],
                            "reason": "no env_files configured"}
+        # L-2: link_files mirrors env_files but symlinks. Runs under the
+        # same "env" step gate so callers can't disable it independently
+        # and slot_bootstrap's fast path always materializes it.
+        if repo_config.link_files:
+            link_result = _link_files(
+                repo_config.link_files, main_path, worktree_path, force=force,
+            )
+        else:
+            link_result = {"status": "skipped", "files_linked": [],
+                           "reason": "no link_files configured"}
 
     deps_result: dict[str, Any] = {"status": "skipped"}
     if "deps" in chosen:
@@ -128,7 +144,7 @@ def bootstrap_repo(
         else:
             deps_result = {"status": "skipped", "reason": "no install_cmd configured"}
 
-    result: dict[str, Any] = {"env": env_result, "deps": deps_result}
+    result: dict[str, Any] = {"env": env_result, "link": link_result, "deps": deps_result}
     if "hooks" in chosen:
         result["hooks"] = _run_hook_install(worktree_path, repo_config)
     return result
@@ -175,6 +191,69 @@ def _copy_env_files(
     out: dict[str, Any] = {
         "status": status,
         "files_copied": copied,
+    }
+    if skipped:
+        out["files_skipped"] = skipped
+    if missing:
+        out["files_missing"] = missing
+    return out
+
+
+# ── step 1b: link-file symlink (L-2) ───────────────────────────────────
+
+def _link_files(
+    link_files: list[str],
+    src_dir: Path,
+    dst_dir: Path,
+    *,
+    force: bool,
+) -> dict[str, Any]:
+    """Symlink each entry relative to ``src_dir`` into ``dst_dir``.
+
+    Mirrors :func:`_copy_env_files` exactly — same missing-source /
+    dest-exists / parent-dir policy — only the materialization differs
+    (``os.symlink`` instead of ``shutil.copy2``). Used for shared mutable
+    state (transcripts/, data/, output/) where copying would fork it.
+
+    Relative-vs-absolute: the symlink target is stored as a path RELATIVE
+    to the link's own directory (``os.path.relpath(src, start=dst.parent)``).
+    src and dst both live under the workspace root, so a relative link is
+    always computable, and a relative link keeps the slot portable (the
+    whole workspace tree can be moved without breaking links). Absolute
+    would also work but would pin the slot to one filesystem location.
+    """
+    linked: list[str] = []
+    skipped: list[str] = []
+    missing: list[str] = []
+    for rel in link_files:
+        src = src_dir / rel
+        dst = dst_dir / rel
+        if not src.exists():
+            missing.append(rel)
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        # `dst.exists()` follows symlinks — also need `islink` to catch a
+        # dangling symlink (exists() returns False for those). Either way
+        # we remove before linking when force=True.
+        if (dst.exists() or dst.is_symlink()) and not force:
+            skipped.append(rel)
+            continue
+        if dst.is_symlink() or dst.exists():
+            dst.unlink()
+        target = os.path.relpath(src, start=str(dst.parent))
+        os.symlink(target, dst)
+        linked.append(rel)
+
+    if missing and not linked and not skipped:
+        status = "missing_source"
+    elif linked or skipped:
+        status = "ok"
+    else:
+        status = "skipped"
+
+    out: dict[str, Any] = {
+        "status": status,
+        "files_linked": linked,
     }
     if skipped:
         out["files_skipped"] = skipped
